@@ -1,0 +1,8 @@
+.git
+.env
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+data/cwe/*.zip
+work

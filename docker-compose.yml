@@ -1,0 +1,68 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      WORK_ROOT: /work
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL:?Set SUPABASE_DB_URL in .env; see .env.example}
+      JOB_TTL_SECONDS: "3600"
+      MAX_UPLOAD_BYTES: "25000000"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5-coder:7b}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["jobs:/work"]
+    networks: [inside, egress]
+    read_only: true
+    tmpfs: ["/tmp:size=64m,noexec,nosuid"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    user: "10001:10001"
+
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:8000:8080"
+    depends_on: [api]
+    networks: [inside, edge]
+    read_only: true
+    tmpfs: ["/var/cache/nginx:size=16m,noexec,nosuid", "/var/run:size=1m,noexec,nosuid", "/tmp:size=16m,noexec,nosuid"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "worker.py"]
+    environment:
+      WORK_ROOT: /work
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL:?Set SUPABASE_DB_URL in .env; see .env.example}
+      JOB_TTL_SECONDS: "3600"
+      JOB_TIMEOUT_SECONDS: "90"
+      MAX_PROJECT_FILES: "5000"
+      MAX_EXTRACTED_BYTES: "100000000"
+    volumes: ["jobs:/work"]
+    networks: [egress]
+    read_only: true
+    tmpfs: ["/tmp:size=256m,noexec,nosuid"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 128
+    user: "10001:10001"
+
+volumes:
+  jobs:
+
+networks:
+  inside:
+    internal: true
+  egress:
+  edge:
+    driver: bridge

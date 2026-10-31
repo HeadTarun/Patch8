@@ -1,0 +1,16 @@
+rules:
+  - id: buffer-unchecked-strcpy
+    languages: [c, cpp]
+    message: strcpy copies an unbounded source into a destination buffer; verify destination capacity and input length.
+    severity: WARNING
+    pattern: strcpy($DEST, $SRC)
+  - id: buffer-unchecked-strcat
+    languages: [c, cpp]
+    message: strcat appends an unbounded source into a destination buffer; verify remaining capacity and input length.
+    severity: WARNING
+    pattern: strcat($DEST, $SRC)
+  - id: buffer-unchecked-sprintf
+    languages: [c, cpp]
+    message: sprintf writes formatted output without a destination size; verify the output fits the destination buffer.
+    severity: WARNING
+    pattern: sprintf($DEST, ...)
