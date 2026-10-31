@@ -170,11 +170,12 @@ def _semgrep(root: Path, files: list[Path]) -> dict:
                 except (OSError, UnicodeDecodeError):
                     source_text = ""
                 var = re.escape(destination.strip())
-                prefix = "\n".join(source_text.splitlines()[:int(start.get("line", 1))])
-                if re.search(rf"\b(?:char|unsigned\s+char)\s+{var}\s*\[", prefix):
+                line_index = max(0, int(start.get("line", 1)) - 1)
+                context = source_text.splitlines()[line_index] if source_text.splitlines() else ""
+                if re.search(rf"\b(?:char|unsigned\s+char)\s+{var}\s*\[", context):
                     cwe_id = "CWE-121"
                     rationale = "The destination is declared as a local character array; a stack-based overflow is a candidate, not confirmed."
-                elif re.search(rf"\b(?:char|unsigned\s+char)\s*\*\s*{var}\s*=\s*(?:\([^)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(", prefix):
+                elif re.search(rf"\b(?:char|unsigned\s+char)\s*\*\s*{var}\s*=\s*(?:\([^)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(", context):
                     cwe_id = "CWE-122"
                     rationale = "The destination is initialized from a heap allocation; a heap-based overflow is a candidate, not confirmed."
             findings.append(_finding(
@@ -263,7 +264,7 @@ def sarif_report(job_id: str, findings: list[dict]) -> dict:
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": "PatchGuard IoT", "informationUri": "https://cwe.mitre.org/", "rules": rules}},
+            "tool": {"driver": {"name": "PatchGuard", "informationUri": "https://cwe.mitre.org/", "rules": rules}},
             "taxonomies": [{"name": "CWE", "version": "5.0", "informationUri": "https://cwe.mitre.org/", "taxa": [{"id": item, "name": get_weakness(item)["name"], "helpUri": get_weakness(item)["url"]} for item in cwe_ids]}],
             "results": results,
         }],

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 import app
 import scanner
+import worker
 from scanner import analyze, parse_cppcheck_output, sarif_report
 from taxonomy import catalog, get_weakness, supported_weaknesses
 from worker import safe_extract
@@ -167,6 +168,44 @@ class ArchiveTests(unittest.TestCase):
             target = base / "output"
             safe_extract(source_zip, target)
             self.assertTrue((target / "firmware" / "main.h").is_file())
+
+
+class RepairValidationTests(unittest.TestCase):
+    def test_repair_context_rejects_source_over_limit(self):
+        finding = {"message": "null dereference", "mapping_confidence": "high", "file": "main.c", "line": 1}
+        cwe = {"id": "CWE-476", "name": "NULL Pointer Dereference", "description": "", "mapping_usage": "", "mitigations": []}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "main.c"
+            with patch.object(app, "MAX_REPAIR_CONTEXT_CHARS", 3):
+                with self.assertRaises(app.HTTPException) as raised:
+                    app._build_repair_context("int x;", finding, cwe, root, target)
+                self.assertIn("repair context limit", raised.exception.detail)
+
+    def test_security_verifier_reports_target_remaining_as_failure(self):
+        original = {"id": "finding", "file": "main.c", "rule_id": "nullPointer", "message": "null dereference", "cwe": {"id": "CWE-476"}}
+        job = {"findings": [original], "repair": {"finding_id": "finding"}}
+        with patch.object(worker, "analyze", return_value={"scan_status": "COMPLETED", "findings": [original]}):
+            self.assertEqual(worker.verify_repair_security(Path("."), job)["status"], "failed")
+
+    def test_security_verifier_never_passes_incomplete_scan(self):
+        original = {"id": "finding", "file": "main.c", "rule_id": "nullPointer", "message": "null dereference", "cwe": {"id": "CWE-476"}}
+        job = {"findings": [original], "repair": {"finding_id": "finding"}}
+        with patch.object(worker, "analyze", return_value={"scan_status": "PARTIAL", "findings": []}):
+            self.assertEqual(worker.verify_repair_security(Path("."), job)["status"], "unverified")
+
+    def test_security_verifier_passes_only_complete_clean_scan(self):
+        original = {"id": "finding", "file": "main.c", "rule_id": "nullPointer", "message": "null dereference", "cwe": {"id": "CWE-476"}}
+        job = {"findings": [original], "repair": {"finding_id": "finding"}}
+        with patch.object(worker, "analyze", return_value={"scan_status": "COMPLETED", "findings": []}):
+            self.assertEqual(worker.verify_repair_security(Path("."), job)["status"], "passed")
+
+    def test_security_verifier_rejects_new_findings(self):
+        original = {"id": "finding", "file": "main.c", "rule_id": "nullPointer", "message": "null dereference", "cwe": {"id": "CWE-476"}}
+        added = {"file": "other.c", "rule_id": "nullPointer", "message": "new null dereference", "cwe": {"id": "CWE-476"}}
+        job = {"findings": [original], "repair": {"finding_id": "finding"}}
+        with patch.object(worker, "analyze", return_value={"scan_status": "COMPLETED", "findings": [added]}):
+            self.assertEqual(worker.verify_repair_security(Path("."), job)["status"], "failed")
 
 
 if __name__ == "__main__":

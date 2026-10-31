@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from db import claim_job, delete_expired_jobs, get_job, save_job
+from analysis_pipeline import run_analysis, validate_analysis_mode
 from scanner import analyze
 
 WORK_ROOT = Path(os.getenv("WORK_ROOT", str(Path(tempfile.gettempdir()) / "patchguard")))
@@ -21,6 +22,7 @@ JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 MAX_FILES = int(os.getenv("MAX_PROJECT_FILES", "5000"))
 MAX_EXTRACTED = int(os.getenv("MAX_EXTRACTED_BYTES", "100000000"))
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "90"))
+ANALYSIS_MODE = validate_analysis_mode(os.getenv("ANALYSIS_MODE", "legacy"))
 SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".idea", ".vscode"}
 JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -168,6 +170,42 @@ def validate_build(job_dir: Path, source: Path) -> dict:
     return result
 
 
+def verify_repair_security(source: Path, job: dict) -> dict:
+    repair = job.get("repair") or {}
+    target = next((item for item in job.get("findings", []) if item.get("id") == repair.get("finding_id")), None)
+    if not target:
+        return {"status": "unverified", "details": "The original finding is unavailable for comparison."}
+
+    report = analyze(source)
+    original_cwe = (target.get("cwe") or {}).get("id")
+    target_remains = any(
+        item.get("file") == target.get("file")
+        and item.get("rule_id") == target.get("rule_id")
+        and (item.get("cwe") or {}).get("id") == original_cwe
+        for item in report.get("findings", [])
+    )
+    if target_remains:
+        return {"status": "failed", "details": "The target finding remains after the repair."}
+
+    def key(item: dict) -> tuple:
+        return item.get("file"), item.get("rule_id"), (item.get("cwe") or {}).get("id"), item.get("message")
+
+    original_counts: dict[tuple, int] = {}
+    for item in job.get("findings", []):
+        identity = key(item)
+        original_counts[identity] = original_counts.get(identity, 0) + 1
+    patched_counts: dict[tuple, int] = {}
+    for item in report.get("findings", []):
+        identity = key(item)
+        patched_counts[identity] = patched_counts.get(identity, 0) + 1
+    new_findings = sum(max(0, count - original_counts.get(identity, 0)) for identity, count in patched_counts.items())
+    if new_findings:
+        return {"status": "failed", "details": f"The patched scan reported {new_findings} new finding(s)."}
+    if report.get("scan_status") != "COMPLETED":
+        return {"status": "unverified", "details": "One or more analyzers did not complete successfully."}
+    return {"status": "passed", "details": "The target finding is absent and no new findings were reported."}
+
+
 def run_benchmark(source: Path, build: Path) -> dict | None:
     manifest_path = source / ".patchguard" / "benchmark.json"
     if not manifest_path.is_file() or manifest_path.stat().st_size > 16_000:
@@ -227,8 +265,9 @@ def process(job_id: str) -> None:
         else:
             safe_extract(original, source)
             original.unlink(missing_ok=True)
-        update(job_id, progress="Running Clang, Cppcheck, and Semgrep")
-        report = analyze(source)
+        progress = "Running Clang, Cppcheck, and Semgrep" if ANALYSIS_MODE == "legacy" else f"Running PatchGuard {ANALYSIS_MODE} analysis with Clang, Cppcheck, and Semgrep"
+        update(job_id, progress=progress)
+        report = run_analysis(source, ANALYSIS_MODE)
         update(job_id, progress="Checking project build and tests")
         validation_source = job_dir / "validation-source"
         shutil.copytree(source, validation_source)
@@ -254,6 +293,9 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
         shutil.rmtree(validation_source, ignore_errors=True)
         shutil.copytree(job_dir / "patched", validation_source)
         checks = validate_build(job_dir, validation_source)
+        security = verify_repair_security(validation_source, job)
+        checks["security"] = security["status"]
+        checks["security_details"] = security["details"]
         patched_benchmark = run_benchmark(validation_source, job_dir / "validation-build") if checks["build"] == "passed" else None
         shutil.rmtree(validation_source, ignore_errors=True)
         baseline = job.get("performance_baseline")
@@ -264,17 +306,23 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
             checks["performance"] = "measured"
         elif baseline:
             checks["performance"] = "not_available"
+        required_checks = ("build", "tests", "sanitizers", "security")
+        checks["verification"] = (
+            "failed" if any(checks.get(name) == "failed" for name in required_checks)
+            else "passed" if all(checks.get(name) == "passed" for name in required_checks)
+            else "unverified"
+        )
         job["checks"] = checks
         job["performance"] = performance
         job["repair"]["checks"] = checks
         job["repair"]["state"] = "applied_to_copy"
         job["state"] = "complete"
-        job["progress"] = "Patch checks complete"
+        job["progress"] = f"Patch verification {checks['verification']}"
         save_job(job)
     except Exception as exc:
         job["state"] = "complete"
         job["progress"] = "Patch applied; validation failed to run"
-        job["checks"] = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "performance": "not_measured", "details": str(exc)[:1000]}
+        job["checks"] = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "security": "unverified", "security_details": str(exc)[:1000], "verification": "unverified", "performance": "not_measured", "details": str(exc)[:1000]}
         job["performance"] = None
         job["repair"]["checks"] = job["checks"]
         job["repair"]["state"] = "applied_to_copy"

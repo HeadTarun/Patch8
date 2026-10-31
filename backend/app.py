@@ -29,8 +29,10 @@ MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_BYTES", "25000000"))
 MAX_FILES = int(os.getenv("MAX_PROJECT_FILES", "5000"))
 MAX_EXTRACTED = int(os.getenv("MAX_EXTRACTED_BYTES", "100000000"))
 MAX_SOURCE = int(os.getenv("MAX_SOURCE_BYTES", "200000"))
+MAX_REPAIR_CONTEXT_CHARS = int(os.getenv("MAX_REPAIR_CONTEXT_CHARS", "24000"))
+MAX_REPAIR_CHANGED_LINES = int(os.getenv("MAX_REPAIR_CHANGED_LINES", "200"))
 SOURCE_EXTENSIONS = {".c", ".cpp", ".h"}
-app = FastAPI(title="PatchGuard IoT", version="0.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PatchGuard", version="0.1.0", docs_url=None, redoc_url=None)
 
 
 def _job_key(job_id: str) -> str:
@@ -54,6 +56,48 @@ def _repair_path(job_id: str, repair_id: str) -> Path:
     if not re.fullmatch(r"[0-9a-f-]{36}", repair_id):
         raise HTTPException(404, "Repair proposal not found.")
     return JOBS_ROOT / job_id / "repairs" / f"{repair_id}.json"
+
+
+def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Path, target: Path) -> dict:
+    if len(before) > MAX_REPAIR_CONTEXT_CHARS:
+        raise HTTPException(413, "This source file exceeds the configured repair context limit.")
+    headers = []
+    header_chars = 0
+    seen_headers = set()
+    for include in re.findall(r'^\s*#\s*include\s*"([^"]+)"', before, flags=re.MULTILINE):
+        header = (target.parent / include).resolve()
+        if header.suffix.lower() != ".h" or not header.is_relative_to(source_root.resolve()) or not header.is_file() or header in seen_headers:
+            continue
+        seen_headers.add(header)
+        try:
+            if header.stat().st_size > 6_000 - header_chars:
+                continue
+            content = header.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        addition = len(content)
+        if addition > 6_000 - header_chars:
+            continue
+        headers.append(f"{header.relative_to(source_root.resolve()).as_posix()}:\n{content}")
+        header_chars += addition
+    return {
+        "finding": finding["message"],
+        "evidence": finding.get("evidence", finding["message"]),
+        "cwe": f"{cwe['id']} — {cwe['name']}",
+        "description": cwe["description"],
+        "mapping_usage": cwe["mapping_usage"],
+        "mitigations": " ".join(cwe["mitigations"][:2]),
+        "mapping_confidence": finding["mapping_confidence"],
+        "file": finding["file"],
+        "line": finding["line"],
+        "source": before,
+        "headers": "\n\n".join(headers) or "No bounded project headers were included.",
+    }
+
+
+def _changed_line_count(before: str, after: str) -> int:
+    matcher = difflib.SequenceMatcher(a=before.splitlines(), b=after.splitlines())
+    return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal")
 
 
 @app.get("/api/health")
@@ -186,29 +230,25 @@ def create_repair(job_id: str, finding_id: str) -> dict:
     cwe = get_weakness(finding["cwe"]["id"])
     if not cwe:
         raise HTTPException(400, "CWE mapping could not be loaded.")
-    prompt = (
-        f"Repair this C/C++ firmware finding with the smallest safe change.\n\n"
-        f"Finding: {finding['message']}\nCWE: {cwe['id']} — {cwe['name']}\n"
-        f"CWE description: {cwe['description']}\n"
-        f"CWE mapping-use guidance: {cwe['mapping_usage']}\n"
-        f"CWE mitigations: {' '.join(cwe['mitigations'][:2])}\n"
-        f"Mapping confidence: {finding['mapping_confidence']}\n"
-        f"File path: {finding['file']}\nLine: {finding['line']}\n"
-        "Return JSON with keys file, code, explanation. The file value must exactly match the provided path.\n\n"
-        f"Current file content:\n{before[:24000]}"
-    )
     try:
-        result = json.loads(generate(job["provider"], prompt))
-    except (RuntimeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        result = generate(job["provider"], _build_repair_context(before, finding, cwe, source_root, target))
+    except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
-    if result.get("file") != finding["file"] or not isinstance(result.get("code"), str):
+    if result.file != finding["file"]:
         raise HTTPException(502, "The repair response did not match the requested file.")
-    after = result["code"]
-    if len(after) > 300_000 or after == before:
+    after = result.code
+    if after == before:
         raise HTTPException(422, "The model returned no usable source change.")
+    max_output_chars = min(MAX_REPAIR_CONTEXT_CHARS + 4_000, max(len(before) * 2, len(before) + 2_048))
+    if len(after) > max_output_chars:
+        raise HTTPException(422, "The proposed replacement is too large relative to the source file.")
+    changed_lines = _changed_line_count(before, after)
+    allowed_changes = min(MAX_REPAIR_CHANGED_LINES, max(10, len(before.splitlines()) // 3))
+    if changed_lines > allowed_changes:
+        raise HTTPException(422, "The proposed repair changes too much source to apply safely.")
     diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=f"a/{finding['file']}", tofile=f"b/{finding['file']}"))
     repair_id = str(uuid.uuid4())
-    repair = {"id": repair_id, "finding_id": finding_id, "file": finding["file"], "code": after, "diff": diff, "explanation": str(result.get("explanation", ""))[:2000], "state": "proposed", "created_at": time.time()}
+    repair = {"id": repair_id, "finding_id": finding_id, "file": finding["file"], "code": after, "diff": diff, "explanation": result.explanation, "state": "proposed", "created_at": time.time()}
     repair_dir = JOBS_ROOT / job_id / "repairs"
     repair_dir.mkdir(parents=True, exist_ok=True)
     _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
@@ -234,7 +274,7 @@ def apply_repair(job_id: str, repair_id: str) -> dict:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(repair["code"], encoding="utf-8")
     repair["state"] = "validating"
-    repair["checks"] = {"build": "running", "tests": "not_available", "sanitizers": "not_available", "performance": "not_measured"}
+    repair["checks"] = {"build": "running", "tests": "not_available", "sanitizers": "not_available", "security": "running", "verification": "running", "performance": "not_measured"}
     job["state"] = "validating"
     job["progress"] = "Checking the patched copy in an offline sandbox"
     job["repair"] = {key: repair[key] for key in ("id", "finding_id", "file", "diff", "explanation", "state", "checks")}

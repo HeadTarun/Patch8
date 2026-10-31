@@ -1,4 +1,4 @@
-# PatchGuard IoT — Software Requirements Specification
+# PatchGuard — Software Requirements Specification
 
 **Version:** 0.1 MVP  
 **Taxonomy baseline:** MITRE CWE 5.0 / Schema 8.0  
@@ -28,9 +28,9 @@ Hosted source transfer occurs only after the user selected Hosted API and clicks
 | FR-02 | Run Clang Static Analyzer, Cppcheck, and custom Semgrep rules in the restricted, non-root worker. Normalize findings and suspicious candidates with source location, analyzer/rule, evidence, classification, and CWE mapping only when supported by the evidence. Report analyzer failures explicitly. |
 | FR-03 | Use the bundled MITRE CWE 5.0 XML data; return taxonomy and schema versions in the API and report; use CWE IDs for findings and never use a view/grouping ID as a finding. |
 | FR-04 | Show CWE description, direct MITRE link, mitigation guidance, analyzer evidence, mapping rationale, and whether the weakness is in the 2025 Top 25. Top 25 membership is contextual, not a firmware risk score. |
-| FR-05 | Generate a repair proposal from the finding and its CWE guidance using an explicitly selected hosted or Ollama provider. Reject responses targeting a different file or returning an unchanged/oversized file. |
+| FR-05 | Generate a bounded-context repair proposal from the finding and its CWE guidance using an explicitly selected hosted or Ollama provider. Parse Ollama output with a schema-constrained LangChain model, then reject responses targeting a different file, returning an unchanged/oversized file, or exceeding the configured change limit. |
 | FR-06 | Apply a proposal to a copied workspace, preserve the uploaded source, and make the unified diff and patched ZIP downloadable. |
-| FR-07 | Report build, tests, sanitizers, and performance separately as passed, failed, running, not available, or not measured. Never infer success for a check that did not run. |
+| FR-07 | Report build, tests, sanitizers, independent post-patch security analysis, overall verification, and performance separately. Verification is passed, failed, or unverified; never infer success for a check that did not run. |
 | FR-08 | Export SARIF 2.1.0 with CWE taxonomy 5.0 and source locations. |
 | FR-09 | Expire job state and files after one hour; delete expired job rows and workspace directories in the worker. |
 

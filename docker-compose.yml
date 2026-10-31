@@ -13,7 +13,11 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5-coder:7b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-32768}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-12000}
+      MAX_REPAIR_CONTEXT_CHARS: ${MAX_REPAIR_CONTEXT_CHARS:-24000}
+      MAX_REPAIR_CHANGED_LINES: ${MAX_REPAIR_CHANGED_LINES:-200}
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes: ["jobs:/work"]
     networks: [inside, egress]
@@ -44,6 +48,7 @@ services:
       SUPABASE_DB_URL: ${SUPABASE_DB_URL:?Set SUPABASE_DB_URL in .env; see .env.example}
       JOB_TTL_SECONDS: "3600"
       JOB_TIMEOUT_SECONDS: "90"
+      ANALYSIS_MODE: ${ANALYSIS_MODE:-legacy}
       MAX_PROJECT_FILES: "5000"
       MAX_EXTRACTED_BYTES: "100000000"
     volumes: ["jobs:/work"]

@@ -1,4 +1,4 @@
-# PatchGuard IoT
+# PatchGuard
 
 PatchGuard scans C/C++ firmware projects and source files, reports evidence-backed memory-safety findings, and helps developers review repair proposals.
 
@@ -21,6 +21,8 @@ Open <http://localhost:8000>. The web container publishes this port on the host-
 
 Supabase Postgres stores job metadata and acts as the durable queue. The worker claims pending rows with `FOR UPDATE SKIP LOCKED`; no Redis service or Redis socket is used. Source archives and repair proposals remain in the one-hour local `jobs` volume and are removed by worker cleanup.
 
+The worker defaults to `ANALYSIS_MODE=legacy`, which preserves the current scanner response. To inspect the additive IR pipeline, set `ANALYSIS_MODE=shadow` in `.env`; this intentionally runs the analyzers a second time and stores comparison data separately. `ANALYSIS_MODE=unified` opts into IR-normalized findings mapped back to the existing response shape. See [the analysis architecture](docs/ANALYSIS_ARCHITECTURE.md).
+
 ### Supabase connection troubleshooting
 
 If worker logs report `Network is unreachable` for a `2a05:...` address, the configured direct database hostname resolved to IPv6 but the Docker network has no IPv6 route. In Supabase **Connect**, copy the **Session pooler** string (port `5432`) into `SUPABASE_DB_URL`; for the shared pooler, use `patchguard_backend.<project-ref>` as the username. Keep `sslmode=require`, then recreate the stack with `docker compose down --remove-orphans` and `docker compose up --build`. The worker backs off between connection retries and logs this fix as a hint.
@@ -29,7 +31,7 @@ If worker logs report `Network is unreachable` for a `2a05:...` address, the con
 
 For hosted repairs, set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment before starting Compose. Selecting **Hosted API** discloses that relevant source will be sent to that provider.
 
-For Ollama, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL`; the API service must be able to reach that Ollama endpoint. Selecting **Ollama** keeps model traffic on the configured local endpoint.
+For Ollama, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL`; the API service must be able to reach that Ollama endpoint. The default model is `qwen2.5:3b`. The API uses LangChain's Ollama chat integration with schema-constrained proposals. Source files over `MAX_REPAIR_CONTEXT_CHARS` (24,000 characters by default) are declined rather than truncated. This character limit is a conservative proxy for token use; it is not an exact tokenizer count.
 
 Without model configuration, scanning and reports still work; repair generation explains how to configure a provider.
 
@@ -42,8 +44,8 @@ Uploaded projects and generated artifacts are stored in the `jobs` volume and ex
 ## Supported MVP checks
 
 - C/C++ scans: Clang Static Analyzer and Cppcheck report CWE-476 diagnostics; custom Semgrep rules report risky buffer operations as candidates and map CWE-120/121/122 only from available destination context. Analyzer failures are reported as partial or failed scans.
-- Repairs: hosted OpenAI-compatible chat-completions API or Ollama chat API.
-- Evidence: build and test checks are attempted only for detected CMake/CTest or Make projects. AddressSanitizer/UndefinedBehaviorSanitizer checks are attempted for CMake projects with tests. Performance comparison is opt-in through a project benchmark manifest.
+- Repairs: hosted OpenAI-compatible chat-completions API or LangChain `ChatOllama`; proposals are size- and change-bounded, applied only to a copy, then independently rescanned.
+- Evidence: build and test checks are attempted only for detected CMake/CTest or Make projects. AddressSanitizer/UndefinedBehaviorSanitizer checks are attempted for CMake projects with tests. Security and overall verification report passed, failed, or unverified; unavailable checks are never passes. Performance comparison is opt-in through a project benchmark manifest.
 - Exports: patch ZIP and SARIF 2.1.0.
 
 ### Optional benchmark
