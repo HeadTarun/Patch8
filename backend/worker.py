@@ -23,7 +23,8 @@ MAX_FILES = int(os.getenv("MAX_PROJECT_FILES", "5000"))
 MAX_EXTRACTED = int(os.getenv("MAX_EXTRACTED_BYTES", "100000000"))
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "90"))
 ANALYSIS_MODE = validate_analysis_mode(os.getenv("ANALYSIS_MODE", "legacy"))
-SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".idea", ".vscode"}
+SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", "venv", ".venv", "__pycache__", "target", ".idea", ".vscode"}
+SOURCE_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -68,13 +69,13 @@ def safe_extract(archive_path: Path, target: Path) -> int:
                         raise ValueError(f"Expanded project exceeds {MAX_EXTRACTED // 1_000_000} MB.")
                     output.write(chunk)
             written += 1
-    if written == 0 or not any(path.is_file() and path.suffix.lower() in {".c", ".cpp", ".h"} for path in target.rglob("*")):
-        raise ValueError("The ZIP archive must contain at least one .c, .cpp, or .h source file.")
+    if written == 0 or not any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS for path in target.rglob("*")):
+        raise ValueError("The ZIP archive must contain at least one C/C++ source file.")
     # ZIPs commonly wrap their contents in one top-level directory.
     children = list(target.iterdir())
-    if len(children) == 1 and children[0].is_dir() and not any(children[0].glob("*.c")):
+    if len(children) == 1 and children[0].is_dir() and not any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS - {".h", ".hh", ".hpp", ".hxx"} for path in children[0].rglob("*")):
         nested = children[0]
-        if any(nested.rglob("*.c")) or any(nested.rglob("*.cpp")):
+        if any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS - {".h", ".hh", ".hpp", ".hxx"} for path in nested.rglob("*")):
             for child in nested.iterdir():
                 shutil.move(str(child), target / child.name)
             nested.rmdir()
@@ -262,6 +263,9 @@ def process(job_id: str) -> None:
             if not uploaded.is_file():
                 raise ValueError("Uploaded source file is missing.")
             shutil.move(str(uploaded), source / uploaded.name)
+        elif job.get("upload_kind") == "project":
+            shutil.copytree(job_dir / "upload-source", source)
+            shutil.rmtree(job_dir / "upload-source", ignore_errors=True)
         else:
             safe_extract(original, source)
             original.unlink(missing_ok=True)

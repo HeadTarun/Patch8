@@ -1,0 +1,16 @@
+"use client";
+import { useRemote } from "@/lib/use-remote";
+import { getProviders } from "@/lib/api";
+import { AppShell } from "@/components/app-shell";
+import { EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
+import { KeyRound, ShieldCheck } from "lucide-react";
+export default function Settings() {
+  const {data,error,loading,retry}=useRemote(getProviders);
+  return <AppShell active="Settings"><main className="app-content"><div className="page-head"><div><div className="eyebrow">WORKSPACE CONFIGURATION</div><h1>Settings</h1><p>Provider status is read from the backend environment. Credentials never reach the browser.</p></div></div>
+    {loading?<LoadingState rows={3}/>:error?<ErrorState retry={retry}/>:!data?<EmptyState title="No provider status available"/>:<div className="settings-grid">
+      <section className="panel setting-card"><div className="panel-head"><h2>AI providers</h2><KeyRound size={17} className="accent"/></div>{(["ollama","groq"] as const).map(name=>{const provider=data.providers[name];const status=name==="ollama"?(provider.model_available?"Model ready":provider.available?"Model not installed":provider.configured?"Endpoint offline":"Not configured"):(provider.configured?"Configured · checked on request":"Not configured");const good=name==="ollama"?provider.model_available:provider.configured;return <div className="setting-row" key={name}><span><strong>{name==="ollama"?"Ollama Local":"Groq Cloud"}</strong><small>{provider.model||"Model configured by backend"}</small></span><span className={`status-pill ${good?"good":provider.configured?"":"bad"}`}>{status}</span></div>})}<p className="muted">Automatic mode tries Ollama first, then Groq. If Ollama is unavailable, finding context is sent to Groq for the explanation or repair. Each result identifies the provider used. Credentials stay in server environment variables.</p></section>
+      <section className="panel setting-card"><div className="panel-head"><h2>Active analysis</h2><ShieldCheck size={17} className="accent"/></div>{["Clang Static Analyzer","Cppcheck","Semgrep"].map(name=><div className="setting-row" key={name}><span><strong>{name}</strong><small>Runs inside the isolated worker image</small></span><span className="status-pill good">Enabled</span></div>)}<p className="muted">Analyzer availability and per-scan results are shown in the scan report. Dependency advisory and secrets scanning are not present in this C/C++ scanner.</p></section>
+      <section className="panel setting-card"><div className="panel-head"><h2>Data and retention</h2><span className="tag">1 HOUR</span></div><p>Uploaded project files, scan findings, and repair copies expire after the configured job retention window. Source files are analyzed in the worker container; source is not executed on the host.</p><p className="muted">Scans are scoped to signed-in Supabase Auth accounts. Email confirmation follows the project’s Auth settings. Password reset, multi-factor authentication, and persistent API-key management are not implemented. Keep the service behind HTTPS and on a trusted network.</p></section>
+    </div>}
+  </main></AppShell>;
+}

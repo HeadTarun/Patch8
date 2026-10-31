@@ -11,14 +11,14 @@ from pathlib import Path
 
 from taxonomy import get_weakness
 
-SOURCE_EXTENSIONS = {".c", ".cpp", ".h"}
+SOURCE_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 CWES = ("CWE-120", "CWE-121", "CWE-122", "CWE-476")
 CLANG_CWE_RULES = {"core.NullDereference": "direct"}
 RULES_PATH = Path(__file__).with_name("semgrep.yml")
 
 
 def source_files(root: Path) -> list[Path]:
-    ignored = {".git", "node_modules", "build", "dist", "vendor"}
+    ignored = {".git", "node_modules", "build", "dist", "vendor", "venv", ".venv", "__pycache__", "target"}
     return [
         path for path in root.rglob("*")
         if path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS

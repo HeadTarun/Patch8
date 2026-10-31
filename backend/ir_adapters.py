@@ -30,7 +30,7 @@ def detect_language(path: str) -> Language:
     suffix = Path(path).suffix.lower()
     if suffix == ".c":
         return Language.C
-    if suffix == ".cpp":
+    if suffix in {".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"}:
         return Language.CPP
     return Language.UNKNOWN
 

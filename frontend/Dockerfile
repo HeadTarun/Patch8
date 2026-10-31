@@ -3,9 +3,9 @@ WORKDIR /ui
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
-RUN npm run build
+RUN npm run build:legacy
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=build /ui/dist /usr/share/nginx/html
+COPY --from=build /ui/dist /usr/share/nginx/html/firmware
 EXPOSE 8080

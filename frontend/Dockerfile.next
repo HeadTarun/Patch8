@@ -1,0 +1,22 @@
+FROM node:24-alpine AS deps
+WORKDIR /ui
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+FROM node:24-alpine AS build
+WORKDIR /ui
+ARG NEXT_PUBLIC_SPLINE_SCENE_URL=
+ENV NEXT_PUBLIC_SPLINE_SCENE_URL=$NEXT_PUBLIC_SPLINE_SCENE_URL
+COPY --from=deps /ui/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:24-alpine AS run
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build --chown=node:node /ui/.next/standalone ./
+COPY --from=build --chown=node:node /ui/.next/static ./.next/static
+COPY --from=build --chown=node:node /ui/public ./public
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]

@@ -1,0 +1,4 @@
+import { AlertCircle, Inbox, RotateCcw } from "lucide-react";
+export function LoadingState({ rows = 3 }: { rows?: number }) { return <div aria-label="Loading" aria-live="polite" className="grid gap-3">{Array.from({ length: rows }, (_, i) => <div className="skeleton-card" key={i} />)}</div>; }
+export function EmptyState({ title = "Nothing here yet", body = "When there is activity, it will show up here." }: { title?: string; body?: string }) { return <div className="panel empty-state"><Inbox size={23} /><h3>{title}</h3><p>{body}</p></div>; }
+export function ErrorState({ retry }: { retry: () => void }) { return <div role="alert" className="panel error-state"><AlertCircle size={23} /><h3>We couldn't load this view</h3><p>Try again in a moment.</p><button className="button small" onClick={retry}><RotateCcw size={14} /> Try again</button></div>; }

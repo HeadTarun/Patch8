@@ -7,11 +7,20 @@ services:
     environment:
       WORK_ROOT: /work
       SUPABASE_DB_URL: ${SUPABASE_DB_URL:?Set SUPABASE_DB_URL in .env; see .env.example}
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET in .env; see .env.example}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8000}
+      DEMO_EMAIL: ${DEMO_EMAIL:-}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       JOB_TTL_SECONDS: "3600"
       MAX_UPLOAD_BYTES: "25000000"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-32768}
@@ -30,13 +39,30 @@ services:
   web:
     build: ./frontend
     ports:
-      - "127.0.0.1:8000:8080"
-    depends_on: [api]
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8080"
+    depends_on: [api, next]
     networks: [inside, edge]
     read_only: true
     tmpfs: ["/var/cache/nginx:size=16m,noexec,nosuid", "/var/run:size=1m,noexec,nosuid", "/tmp:size=16m,noexec,nosuid"]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+
+  next:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.next
+      args:
+        NEXT_PUBLIC_SPLINE_SCENE_URL: ${NEXT_PUBLIC_SPLINE_SCENE_URL:-}
+    environment:
+      NEXT_PUBLIC_SPLINE_SCENE_URL: ${NEXT_PUBLIC_SPLINE_SCENE_URL:-}
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    networks: [inside]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    user: "1000:1000"
 
   worker:
     build:

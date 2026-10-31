@@ -25,6 +25,15 @@ def get_job(job_id: str) -> dict | None:
     return row[0] if row else None
 
 
+def list_user_jobs(owner_id: str, limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT payload FROM public.patchguard_jobs WHERE payload->>'owner_id' = %s AND expires_at > now() ORDER BY created_at DESC LIMIT %s",
+            (owner_id, limit),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def save_job(job: dict) -> None:
     expires_at = float(job.get("expires_at", time.time() + 3600))
     created_at = float(job.get("created_at", time.time()))

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import auth
+import providers
 
 from fastapi.testclient import TestClient
 import app
@@ -16,6 +19,109 @@ import worker
 from scanner import analyze, parse_cppcheck_output, sarif_report
 from taxonomy import catalog, get_weakness, supported_weaknesses
 from worker import safe_extract
+
+
+class AuthTests(unittest.TestCase):
+    def test_signed_session(self):
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64}):
+            token = auth.issue_session("user-id", "dev@example.com")
+            self.assertEqual(auth.read_session(token)["id"], "user-id")
+            self.assertIsNone(auth.read_session(token + "tampered"))
+
+    def test_job_api_requires_a_session(self):
+        self.assertEqual(TestClient(app.app).get("/api/jobs").status_code, 401)
+
+    def test_registration_sets_session_and_me_returns_user(self):
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64, "AUTH_COOKIE_SECURE": "false"}), patch.object(app, "supabase_auth", return_value={"user": {"id": "auth-user-1", "email": "dev@example.com"}, "access_token": "ignored"}):
+            client = TestClient(app.app)
+            registered = client.post("/api/auth/register", json={"email": "Dev@Example.com", "password": "correct horse battery"})
+            self.assertEqual(registered.status_code, 201, registered.text)
+            self.assertIn("httponly", registered.headers.get("set-cookie", "").lower())
+            self.assertEqual(client.get("/api/auth/me").json()["email"], "dev@example.com")
+
+    def test_registration_reports_email_confirmation_without_session(self):
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64, "FRONTEND_URL": "http://localhost:8000/"}), patch.object(app, "supabase_auth", return_value={"user": {"id": "auth-user-1", "email": "dev@example.com"}}) as sign_up:
+            response = TestClient(app.app).post("/api/auth/register", json={"email": "dev@example.com", "password": "correct horse battery"})
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.json()["requires_email_confirmation"])
+        self.assertNotIn("set-cookie", response.headers)
+        sign_up.assert_called_once_with("signup?redirect_to=http%3A%2F%2Flocalhost%3A8000%2Fauth%2Fcallback", {"email": "dev@example.com", "password": "correct horse battery"})
+
+    def test_auth_callback_validates_supabase_user_and_sets_session(self):
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64, "AUTH_COOKIE_SECURE": "false"}), patch.object(app, "supabase_user", return_value={"id": "auth-user-3", "email": "dev@example.com"}) as verify:
+            client = TestClient(app.app)
+            response = client.post("/api/auth/callback", json={"access_token": "x" * 32})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("httponly", response.headers.get("set-cookie", "").lower())
+            self.assertEqual(client.get("/api/auth/me").json(), {"id": "auth-user-3", "email": "dev@example.com"})
+        verify.assert_called_once_with("x" * 32)
+
+    def test_login_uses_supabase_auth_and_issues_local_session(self):
+        auth_result = {"user": {"id": "auth-user-2", "email": "dev@example.com"}, "access_token": "not-forwarded"}
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64, "AUTH_COOKIE_SECURE": "false"}), patch.object(app, "supabase_auth", return_value=auth_result) as sign_in:
+            client = TestClient(app.app)
+            response = client.post("/api/auth/login", json={"email": "Dev@Example.com", "password": "correct horse battery"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("httponly", response.headers.get("set-cookie", "").lower())
+            self.assertEqual(client.get("/api/auth/me").json(), {"id": "auth-user-2", "email": "dev@example.com"})
+        sign_in.assert_called_once_with("token?grant_type=password", {"email": "dev@example.com", "password": "correct horse battery"})
+
+    def test_demo_login_uses_server_configured_supabase_account(self):
+        result = {"user": {"id": "demo-user", "email": "demo@example.com"}, "access_token": "not-forwarded"}
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64, "AUTH_COOKIE_SECURE": "false", "DEMO_EMAIL": "demo@example.com", "DEMO_PASSWORD": "a demo password kept server-side"}), patch.object(app, "supabase_auth", return_value=result) as sign_in:
+            client = TestClient(app.app)
+            self.assertEqual(client.get("/api/auth/demo/status").json(), {"enabled": True})
+            response = client.post("/api/auth/demo")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(client.get("/api/auth/me").json(), {"id": "demo-user", "email": "demo@example.com"})
+        sign_in.assert_called_once_with("token?grant_type=password", {"email": "demo@example.com", "password": "a demo password kept server-side"})
+
+    def test_demo_login_is_disabled_without_credentials(self):
+        with patch.dict(os.environ, {"DEMO_EMAIL": "", "DEMO_PASSWORD": ""}):
+            client = TestClient(app.app)
+            self.assertEqual(client.get("/api/auth/demo/status").json(), {"enabled": False})
+            self.assertEqual(client.post("/api/auth/demo").status_code, 404)
+
+    def test_github_sign_in_redirects_through_supabase_to_port_8000(self):
+        with patch.dict(os.environ, {"SUPABASE_URL": "https://project.supabase.co", "FRONTEND_URL": "http://localhost:8000/"}):
+            response = TestClient(app.app).get("/api/auth/github", follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["location"], "https://project.supabase.co/auth/v1/authorize?provider=github&redirect_to=http%3A%2F%2Flocalhost%3A8000%2Fauth%2Fcallback")
+
+    def test_session_cannot_read_another_owners_job(self):
+        with patch.dict(os.environ, {"AUTH_SECRET": "s" * 64}), patch.object(app, "get_job", return_value={"id": "00000000-0000-0000-0000-000000000001", "owner_id": "owner-b"}):
+            client = TestClient(app.app)
+            client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
+            response = client.get("/api/jobs/00000000-0000-0000-0000-000000000001")
+        self.assertEqual(response.status_code, 404)
+
+
+class ProviderTests(unittest.TestCase):
+    def test_auto_falls_back_to_groq_and_reports_provider(self):
+        proposal = providers.PatchProposal(file="main.c", code="int main(void) { return 0; }", explanation="fixed")
+        with patch.object(providers, "_ollama", side_effect=RuntimeError("offline")), patch.object(providers, "_groq", return_value=proposal):
+            result, actual = providers.generate_with_provider("auto", {"file": "main.c"})
+        self.assertIs(result, proposal)
+        self.assertEqual(actual, "groq")
+
+    def test_explicit_ollama_does_not_fall_back(self):
+        with patch.object(providers, "_ollama", side_effect=RuntimeError("offline")), patch.object(providers, "_groq") as groq:
+            with self.assertRaises(RuntimeError):
+                providers.generate_with_provider("ollama", {"file": "main.c"})
+        groq.assert_not_called()
+
+    def test_explanations_fall_back_and_report_the_provider(self):
+        result = providers.FindingExplanation(summary="A write may exceed the buffer.", impact="Nearby memory may be corrupted.", recommended_action="Validate the input length.")
+        with patch.object(providers, "_ollama_explanation", side_effect=RuntimeError("offline")), patch.object(providers, "_groq_explanation", return_value=result):
+            explanation, actual = providers.explain_with_provider("auto", {"finding": "overflow"})
+        self.assertIs(explanation, result)
+        self.assertEqual(actual, "groq")
+
+    def test_explicit_ollama_explanation_does_not_fall_back(self):
+        with patch.object(providers, "_ollama_explanation", side_effect=RuntimeError("offline")), patch.object(providers, "_groq_explanation") as groq:
+            with self.assertRaises(RuntimeError):
+                providers.explain_with_provider("ollama", {})
+        groq.assert_not_called()
 
 
 class TaxonomyTests(unittest.TestCase):
@@ -107,11 +213,95 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/health").json()["analyzers"], ["Clang Static Analyzer", "Cppcheck", "Semgrep"])
         self.assertEqual({item["id"] for item in client.get("/api/weaknesses").json()["items"]}, {"CWE-120", "CWE-121", "CWE-122", "CWE-476"})
 
+    def test_explanation_is_authenticated_owner_scoped_and_cached(self):
+        job_id = "00000000-0000-0000-0000-000000000001"
+        finding_id = "finding-1"
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / job_id / "source"
+        source.mkdir(parents=True)
+        (source / "main.c").write_text("char output[4];\nvoid copy(const char *input) { strcpy(output, input); }\n")
+        job = {"id": job_id, "owner_id": "owner-a", "state": "complete", "provider": "ollama", "findings": [{"id": finding_id, "file": "main.c", "line": 2, "message": "Unbounded copy", "evidence": "strcpy", "severity": "high", "classification": "confirmed", "cwe": {"id": "CWE-120"}}]}
+        generated = providers.FindingExplanation(summary="The copy has no size limit.", impact="Long input can overwrite adjacent memory.", recommended_action="Bound the copy by the destination capacity.")
+        with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", root), patch.object(app, "get_job", return_value=job), patch.object(app, "_save_job") as save, patch.object(app, "explain_with_provider", return_value=(generated, "ollama")) as explain:
+            client = TestClient(app.app)
+            endpoint = f"/api/jobs/{job_id}/explain/{finding_id}"
+            self.assertEqual(client.post(endpoint).status_code, 401)
+            client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
+            first = client.post(endpoint)
+            second = client.post(endpoint)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(second.json(), first.json())
+            self.assertEqual(first.json()["provider_used"], "ollama")
+            self.assertEqual(client.get(endpoint).json(), first.json())
+            explain.assert_called_once()
+            save.assert_called_once()
+            self.assertEqual(client.get(f"/api/jobs/{job_id}/explain/missing").status_code, 404)
+            client.cookies.set("patchguard_session", auth.issue_session("owner-b", "b@example.com"))
+            self.assertEqual(client.post(endpoint).status_code, 404)
+
+    def test_explanation_provider_failure_returns_actionable_gateway_error(self):
+        job_id = "00000000-0000-0000-0000-000000000002"
+        finding_id = "finding-2"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / job_id / "source"
+            source.mkdir(parents=True)
+            (source / "main.c").write_text("int main(void) { return 0; }\n")
+            job = {"id": job_id, "owner_id": "owner-a", "state": "complete", "provider": "auto", "findings": [{"id": finding_id, "file": "main.c", "line": 1, "message": "Test finding"}]}
+            with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", root), patch.object(app, "get_job", return_value=job), patch.object(app, "explain_with_provider", side_effect=RuntimeError("Ollama and Groq are unavailable.")):
+                client = TestClient(app.app)
+                client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
+                response = client.post(f"/api/jobs/{job_id}/explain/{finding_id}")
+            self.assertEqual(response.status_code, 502)
+            self.assertIn("Ollama and Groq are unavailable", response.json()["detail"])
+
+    def test_provider_status_reports_reachable_endpoint_with_missing_model(self):
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+            def read(self): return b'{"models":[{"name":"other-model:latest"}]}'
+        with patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://ollama:11434", "OLLAMA_MODEL": "qwen2.5:3b"}), patch.object(app.urllib.request, "urlopen", return_value=Response()):
+            provider = TestClient(app.app).get("/api/providers").json()["providers"]["ollama"]
+        self.assertTrue(provider["available"])
+        self.assertFalse(provider["model_available"])
+
     def post_file(self, filename: str, body: bytes):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        with patch.object(app, "JOBS_ROOT", Path(temporary.name)), patch.object(app, "_save_job"):
-            return TestClient(app.app).post("/api/jobs", files={"file": (filename, body)}, data={})
+        with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temporary.name)), patch.object(app, "_save_job"):
+            client = TestClient(app.app)
+            client.cookies.set("patchguard_session", auth.issue_session("test-user", "test@example.com"))
+            return client.post("/api/jobs", files={"file": (filename, body)}, data={})
+
+    def test_upload_accepts_multiple_nested_source_files(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temporary.name)), patch.object(app, "_save_job") as save:
+            client = TestClient(app.app)
+            client.cookies.set("patchguard_session", auth.issue_session("test-user", "test@example.com"))
+            response = client.post("/api/jobs", files=[("files", ("src/main.c", b"int main(void) { return 0; }\n")), ("files", ("include/main.h", b"int read(void);\n")), ("files", ("CMakeLists.txt", b"cmake_minimum_required(VERSION 3.20)\n")), ("files", ("node_modules/ignored.c", b"not included\n"))], data={"provider": "none"})
+            self.assertEqual(response.status_code, 202, response.text)
+            job = save.call_args.args[0]
+            self.assertEqual(job["upload_kind"], "project")
+            self.assertTrue((Path(temporary.name) / job["id"] / "upload-source" / "src" / "main.c").is_file())
+            self.assertTrue((Path(temporary.name) / job["id"] / "upload-source" / "include" / "main.h").is_file())
+            self.assertTrue((Path(temporary.name) / job["id"] / "upload-source" / "CMakeLists.txt").is_file())
+            self.assertFalse((Path(temporary.name) / job["id"] / "upload-source" / "node_modules").exists())
+
+    def test_single_file_from_folder_keeps_its_path(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temporary.name)), patch.object(app, "_save_job") as save:
+            client = TestClient(app.app)
+            client.cookies.set("patchguard_session", auth.issue_session("test-user", "test@example.com"))
+            response = client.post("/api/jobs", files={"files": ("project/src/main.c", b"int main(void) { return 0; }\n")}, data={"provider": "none"})
+            self.assertEqual(response.status_code, 202, response.text)
+            job = save.call_args.args[0]
+            self.assertEqual(job["upload_kind"], "project")
+            self.assertTrue((Path(temporary.name) / job["id"] / "upload-source" / "project" / "src" / "main.c").is_file())
 
     def test_upload_accepts_standalone_c_cpp_and_defaults_to_scan_only(self):
         for filename in ("main.c", "main.cpp"):
@@ -119,8 +309,8 @@ class ApiTests(unittest.TestCase):
                 response = self.post_file(filename, b"int main(void) { return 0; }\n")
                 self.assertEqual(response.status_code, 202, response.text)
 
-    def test_upload_rejects_header_empty_invalid_encoding_and_oversize(self):
-        self.assertEqual(self.post_file("main.h", b"int x;\n").status_code, 415)
+    def test_upload_accepts_header_and_rejects_empty_invalid_encoding_and_oversize(self):
+        self.assertEqual(self.post_file("main.h", b"int x;\n").status_code, 202)
         self.assertEqual(self.post_file("main.c", b"").status_code, 400)
         self.assertEqual(self.post_file("main.c", b"\xff\xfe").status_code, 400)
         self.assertEqual(self.post_file("main.cpp", b"x" * 200_001).status_code, 413)

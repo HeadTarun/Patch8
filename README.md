@@ -17,7 +17,15 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Open <http://localhost:8000>. The web container publishes this port on the host-facing `edge` network and reaches the API over the private `inside` network. The API itself is not published directly. Upload a project ZIP or a standalone `.c`/`.cpp` file (up to 200 KB); `.h` files must be inside a ZIP. The worker runs Clang Static Analyzer, Cppcheck, and Semgrep as a non-root user. Build/test subprocesses have no network access. Model keys stay on the API service and are never sent to the browser.
+Set `AUTH_SECRET` to a random value of at least 32 characters, and set `SUPABASE_URL` plus the project's publishable key in `SUPABASE_PUBLISHABLE_KEY`. `FRONTEND_URL` defaults to `http://localhost:8000`; add `http://localhost:8000/auth/callback` to Supabase Auth's allowed redirect URLs. Open <http://localhost:8000>, create an account, then upload C/C++ files, a complete folder, or a ZIP project. Supabase Auth handles passwords; its confirmation link returns to the callback on port 8000, which validates the session and sets the PatchGuard cookie. Folder uploads retain supported source and text project files while omitting generated directories. The web container publishes this port on the host-facing `edge` network and reaches the API over the private `inside` network. The API itself is not published directly. The worker runs Clang Static Analyzer, Cppcheck, and Semgrep as a non-root user. Build/test subprocesses have no network access. Model keys stay on the API service and are never sent to the browser.
+
+### Demo sign-in
+
+Create a dedicated demo user in Supabase Auth, confirm its email, then set `DEMO_EMAIL` and `DEMO_PASSWORD` in `.env`. Restart the API with `docker compose up -d --force-recreate api`. The sign-in page shows a **Try demo** button only when both values are configured. Credentials stay on the API and the button signs in through Supabase Auth. Keep the demo account separate from real user data; the demo view starts empty unless you add demo-owned scans.
+
+### GitHub sign-in
+
+The login page redirects to Supabase Auth's GitHub provider and returns to `http://localhost:8000/auth/callback`. In GitHub, create an OAuth App with homepage `http://localhost:8000` and authorization callback `https://<project-ref>.supabase.co/auth/v1/callback`. In Supabase Authentication → Sign In / Providers, enable GitHub and enter that app's client ID and secret. Add `http://localhost:8000/auth/callback` to Supabase Authentication → URL Configuration → Redirect URLs. The OAuth client secret belongs in Supabase, not PatchGuard `.env`.
 
 Supabase Postgres stores job metadata and acts as the durable queue. The worker claims pending rows with `FOR UPDATE SKIP LOCKED`; no Redis service or Redis socket is used. Source archives and repair proposals remain in the one-hour local `jobs` volume and are removed by worker cleanup.
 
@@ -29,7 +37,7 @@ If worker logs report `Network is unreachable` for a `2a05:...` address, the con
 
 ### Repair providers
 
-For hosted repairs, set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment before starting Compose. Selecting **Hosted API** discloses that relevant source will be sent to that provider.
+For Groq repairs, set `GROQ_API_KEY` and optionally `GROQ_MODEL`. The automatic provider tries Ollama and falls back to Groq; scan details report which one generated a proposal. Selecting **Groq Cloud** discloses that relevant source is sent to Groq. The legacy OpenAI-compatible hosted provider remains supported by the API but is not shown in the UI.
 
 For Ollama, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL`; the API service must be able to reach that Ollama endpoint. The default model is `qwen2.5:3b`. The API uses LangChain's Ollama chat integration with schema-constrained proposals. Source files over `MAX_REPAIR_CONTEXT_CHARS` (24,000 characters by default) are declined rather than truncated. This character limit is a conservative proxy for token use; it is not an exact tokenizer count.
 
@@ -37,14 +45,14 @@ Without model configuration, scanning and reports still work; repair generation 
 
 ## Deployment
 
-Run the Compose stack on a Linux VM behind HTTPS termination (for example, a reverse proxy managed by the operator). Keep the service private until authentication and per-user quotas are configured. The MVP enforces upload, file-count, extracted-size, CPU-time, and wall-clock limits; the analysis worker runs as an unprivileged user and its build/test subprocesses run without network access in bubblewrap. The worker needs egress to Supabase Postgres for queue and job state. Restrict VM egress to the Supabase endpoint where the host firewall supports it. Do not mount Docker sockets or model-provider credentials into the worker.
+Run the Compose stack on a Linux VM behind HTTPS termination (for example, a reverse proxy managed by the operator). Set `AUTH_COOKIE_SECURE=true` when HTTPS is enabled. Supabase Auth manages email/password credentials; PatchGuard issues short-lived signed HTTP-only session cookies and scopes jobs to the Auth user ID. Basic upload/login rate limits are process-local. The MVP enforces upload, file-count, extracted-size, CPU-time, and wall-clock limits; the analysis worker runs as an unprivileged user and its build/test subprocesses run without network access in bubblewrap. The worker needs egress to Supabase Postgres for queue and job state. Restrict VM egress to the Supabase endpoint where the host firewall supports it. Do not mount Docker sockets or model-provider credentials into the worker.
 
-Uploaded projects and generated artifacts are stored in the `jobs` volume and expire after one hour. Job state and queue rows are stored in Supabase and deleted after expiry by the worker. For production, add authenticated access, monitored quotas, a database backup/retention policy, and external secrets management before exposing it publicly.
+Uploaded projects and generated artifacts are stored in the `jobs` volume and expire after one hour. Job state and queue rows use the existing `patchguard_jobs` table; account credentials remain in Supabase Auth. Session cookies expire after eight hours. Email confirmation follows Supabase project settings; password reset, multi-factor authentication, shared rate limiting, and external secrets management are not implemented.
 
 ## Supported MVP checks
 
 - C/C++ scans: Clang Static Analyzer and Cppcheck report CWE-476 diagnostics; custom Semgrep rules report risky buffer operations as candidates and map CWE-120/121/122 only from available destination context. Analyzer failures are reported as partial or failed scans.
-- Repairs: hosted OpenAI-compatible chat-completions API or LangChain `ChatOllama`; proposals are size- and change-bounded, applied only to a copy, then independently rescanned.
+- Repairs: automatic Ollama → Groq fallback, manual Ollama or Groq, and legacy hosted OpenAI-compatible chat-completions API; proposals are size- and change-bounded, applied only to a copy, then independently rescanned.
 - Evidence: build and test checks are attempted only for detected CMake/CTest or Make projects. AddressSanitizer/UndefinedBehaviorSanitizer checks are attempted for CMake projects with tests. Security and overall verification report passed, failed, or unverified; unavailable checks are never passes. Performance comparison is opt-in through a project benchmark manifest.
 - Exports: patch ZIP and SARIF 2.1.0.
 
@@ -63,3 +71,13 @@ This is a triage and repair assistant, not a complete CWE scanner or a guarantee
 ## CWE data
 
 The application bundles a reviewed CWE 5.0 catalog snapshot for supported weakness IDs and records the taxonomy version in every report. See `data/cwe/README.md`. CWE IDs identify weakness types; CWE views and groupings are used only for navigation, never as finding IDs.
+
+## API documentation
+
+FastAPI's interactive documentation is served at `/api/docs`; the OpenAPI schema is at `/api/openapi.json`. Account endpoints are `/api/auth/register`, `/api/auth/login`, `/api/auth/logout`, and `/api/auth/me`. Authenticated scan endpoints include `/api/jobs`, `/api/dashboard`, `/api/jobs/{id}`, `/api/jobs/{id}/findings/{finding_id}`, repair/apply/reject routes, SARIF export, patched-project ZIP, and diff download.
+
+## Web application
+
+The web container serves the PatchGuard landing page at `/`, an authenticated dashboard at `/app`, project uploads and scan history at `/app/projects`, findings at `/app/scans`, report exports at `/app/reports`, and the existing firmware upload scanner at `/firmware`. The product preview illustration on the landing page is labeled sample; app metrics and findings come from persisted jobs. This deployment analyzes C/C++ source only. It does not connect Git providers, scan pull requests, create fix PRs, check dependency advisories, or run a dedicated secrets scanner. Optional Spline scene URL: `NEXT_PUBLIC_SPLINE_SCENE_URL` (leave empty to use the static hero illustration).
+
+For local frontend development, run `cd frontend`, `npm install`, and `npm run dev`. To build the production stack, set up the existing `.env` values and run `docker compose up --build`.
