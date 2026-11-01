@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, LoaderCircle, Sparkles } from "lucide-react";
 import { applyRepair, explainFinding, getFindingSource, getPatch, getRepairStatus, getSavedExplanation, rejectRepair, type FindingExplanation } from "../lib/api";
 import { CodePreview, RepairDiffPreview, UnifiedDiffPreview } from "./code-preview";
@@ -13,28 +13,42 @@ export function FindingActions({jobId, findingId, eligible}: {jobId:string; find
   const [explanation,setExplanation]=useState<FindingExplanation|null>(null);
   const [busy,setBusy]=useState(""); const [error,setError]=useState(""); const [ack,setAck]=useState(false); const [reviewed,setReviewed]=useState(false);
   const [view,setView]=useState<"compare"|"original"|"proposed"|"diff">("compare"); const [now,setNow]=useState(Date.now());
-  async function refresh(){try{setStatus(await getRepairStatus(jobId,findingId));}catch(e){setError(e instanceof Error?e.message:"Could not load repair status.");}}
-  useEffect(()=>{
-    setStatus(null);setSource(null);setAck(false);setReviewed(false);setView("compare");
-    void refresh();
-    getFindingSource(jobId,findingId).then(setSource).catch(e=>setError(e.message));
-    getSavedExplanation(jobId,findingId).then(setExplanation).catch(()=>{});
+  const generation=useRef(0); const requestNumber=useRef(0);
+  const refresh=useCallback(async()=>{
+    const current=generation.current;const number=++requestNumber.current;
+    try{const result=await getRepairStatus(jobId,findingId);if(current===generation.current&&number===requestNumber.current)setStatus(result);}
+    catch(e){if(current===generation.current)setError(e instanceof Error?e.message:"Could not load repair status.");}
   },[jobId,findingId]);
+  useEffect(()=>{
+    const current=++generation.current;
+    setStatus(null);setSource(null);setExplanation(null);setError("");setBusy("");setAck(false);setReviewed(false);setView("compare");
+    void refresh();
+    getFindingSource(jobId,findingId).then(value=>{if(current===generation.current)setSource(value)}).catch(e=>{if(current===generation.current)setError(e.message)});
+    getSavedExplanation(jobId,findingId).then(value=>{if(current===generation.current)setExplanation(value)}).catch(()=>{});
+    return()=>{generation.current=current+1};
+  },[jobId,findingId,refresh]);
   const op=status?.operation; const repair=status?.repair; const active=!!status?.job_busy;
   useEffect(()=>{setReviewed(false);setAck(false)},[repair?.id]);
-  useEffect(()=>{if(!active&&busy!=="repair")return;const timer=window.setInterval(()=>{setNow(Date.now());void refresh()},2000);return()=>window.clearInterval(timer)},[jobId,findingId,active,busy]);
+  useEffect(()=>{
+    if(!active&&busy!=="repair"&&busy!=="deep")return;
+    let stopped=false;let timer:ReturnType<typeof setTimeout>;
+    async function poll(){setNow(Date.now());await refresh();if(!stopped)timer=setTimeout(poll,2000)}
+    timer=setTimeout(poll,2000);
+    return()=>{stopped=true;clearTimeout(timer)};
+  },[refresh,active,busy]);
   async function run(action:string){
+    const current=generation.current;
     setBusy(action);setError("");
     try{
-      if(action==="explain")setExplanation(await explainFinding(jobId,findingId));
+      if(action==="explain"){const result=await explainFinding(jobId,findingId);if(current===generation.current)setExplanation(result);}
       if(action==="repair"||action==="deep"){
         if(action==="deep"&&!window.confirm("Deep repair sends relevant source code and prior verification diagnostics to Groq. Continue?"))return;
-        await getPatch(jobId,findingId,action==="deep"?"deep":"standard");await refresh();
+        await getPatch(jobId,findingId,action==="deep"?"deep":"standard");if(current===generation.current)await refresh();
       }
-      if(action==="accept"&&repair){await applyRepair(jobId,repair.id,ack,reviewed);window.location.href=`/app/analysis/${jobId}`;}
-      if(action==="reject"&&repair){await rejectRepair(jobId,repair.id);await refresh();}
-    }catch(e){await refresh();setError(e instanceof Error?e.message:"Request failed.");}
-    finally{setBusy("");}
+      if(action==="accept"&&repair){await applyRepair(jobId,repair.id,ack,reviewed);if(current===generation.current)window.location.href=`/app/analysis/${jobId}`;}
+      if(action==="reject"&&repair){await rejectRepair(jobId,repair.id);if(current===generation.current)await refresh();}
+    }catch(e){if(current===generation.current){await refresh();setError(e instanceof Error?e.message:"Request failed.");}}
+    finally{if(current===generation.current)setBusy("");}
   }
   const outcome=status?.checks?.verification_outcome;
   const attempts=status?.attempt_history?.length?status.attempt_history:op?.attempts||[];
@@ -85,11 +99,11 @@ export function FindingActions({jobId, findingId, eligible}: {jobId:string; find
     </details>)}
     {repair&&<section className="repair-explanation"><p>{repair.explanation}</p>{repair.provider_used&&<p>Generated by {repair.provider_used}{repair.model_used?` · ${repair.model_used}`:""}</p>}<p>{repair.metadata?.security_improvement}</p>{repair.metadata?.reasons?.map((reason,index)=><p key={index}>{reason}</p>)}{repair.metadata&&<p>Added {repair.metadata.added_lines} · deleted {repair.metadata.deleted_lines} lines</p>}{repair.metadata?.warnings?.map((warning,index)=><p key={index}>{warning}</p>)}</section>}
     {repair?.review&&<p className="muted">Author review recorded {new Date(repair.review.reviewed_at*1000).toLocaleString()} · {repair.review.verification_outcome}</p>}
-    <section className="repair-verification"><h4>Verification: {outcome||"Not started"}</h4>{outcome&&outcome!=="verified"&&<p className="muted">Some checks failed or could not run. Review each result below; partial verification does not confirm full correctness.</p>}{checks&&<div className="repair-check-grid">{["build","tests","sanitizers","security"].map(key=><div className="repair-check" key={key}><span>{key}</span><strong className={`verify-${checks[key]==="passed"?"good":checks[key]==="failed"?"bad":["not_available","unverified","partially_verified"].includes(String(checks[key]))?"warn":"neutral"}`}>{String(checks[key]||"pending")}</strong></div>)}</div>}
+    <section className="repair-verification"><h4>Verification: {outcome ? outcome.replaceAll("_", " ") : "Not started"}</h4>{outcome&&outcome!=="verified"&&<p className="muted">Some checks failed or could not run. Review each result below; partial verification does not confirm full correctness.</p>}{checks&&<div className="repair-check-grid">{["build","tests","sanitizers","security"].map(key=><div className="repair-check" key={key}><span>{key}</span><strong className={`verify-${checks[key]==="passed"?"good":checks[key]==="failed"?"bad":["not_available","unverified","partially_verified"].includes(String(checks[key]))?"warn":"neutral"}`}>{String(checks[key]||"pending")}</strong></div>)}</div>}
       {status?.checks?.details&&<details><summary>Build and test details</summary><pre className="verification-diagnostics">{status.checks.details}</pre></details>}
       {status?.checks?.security_details&&<details><summary>Security check details</summary><p>{status.checks.security_details}</p></details>}
     </section>
-    {repair?.state==="review_ready"&&<div className="repair-accept-row"><label><input type="checkbox" checked={reviewed} onChange={event=>setReviewed(event.target.checked)}/> I reviewed the original and proposed code and the verification results.</label>{outcome==="partially_verified"&&<label><input type="checkbox" checked={ack} onChange={event=>setAck(event.target.checked)}/> I understand unavailable checks were not completed.</label>}<button className="button" disabled={!!busy||active} onClick={()=>void run("reject")}>{busy==="reject"?<><LoaderCircle size={14} className="scan-spinner"/> Rejecting…</> : "Reject suggestion"}</button><button className="button primary" disabled={!!busy||!reviewed||(outcome==="partially_verified"&&!ack)} onClick={()=>void run("accept")}>{busy==="accept"?<><LoaderCircle size={14} className="scan-spinner"/> Accepting…</>:<><Check size={14}/> {outcome==="verified"?"Accept verified copy":"Accept reviewed copy"}</>}</button></div>}
+    {repair?.state==="review_ready"&&<div className="repair-accept-row"><label><input type="checkbox" checked={reviewed} onChange={event=>setReviewed(event.target.checked)}/> I reviewed the original and proposed code and the verification results.</label>{outcome==="partially_verified"&&<label><input type="checkbox" checked={ack} onChange={event=>setAck(event.target.checked)}/> I understand unavailable checks were not completed.</label>}<button className="button" disabled={!!busy||active} onClick={()=>void run("reject")}>{busy==="reject"?<><LoaderCircle size={14} className="scan-spinner"/> Rejecting…</> : "Reject suggestion"}</button><button className="button primary" disabled={!!busy||active||!reviewed||!["verified","partially_verified"].includes(outcome||"")||(outcome==="partially_verified"&&!ack)} onClick={()=>void run("accept")}>{busy==="accept"?<><LoaderCircle size={14} className="scan-spinner"/> Accepting…</>:<><Check size={14}/> {outcome==="verified"?"Accept verified copy":"Accept reviewed copy"}</>}</button></div>}
     {repair?.state==="verification_failed"&&<p className="repair-failure-note">This candidate cannot be accepted. Review verification results or retry within the remaining suggestion limit.</p>}
     {repair&&<a href={`/api/jobs/${jobId}/diff`}>Download {outcome==="verified"?"":"unverified "}patch for manual review</a>}
   </div>;

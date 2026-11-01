@@ -11,8 +11,8 @@ export function ScanParticles() {
         </div>
         <pre className="scan-preview-code"><span>82</span> <code>char name[64];</code>{"\n"}<span>83</span> <code>...</code>{"\n"}<span>84</span> <code className="scan-code-risk">strcpy(name, input);</code></pre>
         <div className="scan-preview-result">
-          <div><span className="scan-preview-risk">CWE-120</span><span>Buffer overflow detected</span></div>
-          <span className="scan-preview-verified"><ShieldCheck size={15} /> Fix verified</span>
+          <div><span className="scan-preview-risk">CWE-120</span><span>Buffer operation flagged</span></div>
+          <span className="scan-preview-verified"><ShieldCheck size={15} /> Review required</span>
         </div>
         <div className="scan-preview-progress"><span /></div>
       </div>

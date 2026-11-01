@@ -5,6 +5,8 @@ import json
 import os
 import time
 from dotenv import load_dotenv
+from contextlib import contextmanager
+from verification import verification_outcome
 
 # Load environment variables from the .env file (if present)
 load_dotenv()
@@ -63,8 +65,8 @@ def claim_job() -> tuple[str, dict] | None:
                  ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED
                )
                UPDATE public.patchguard_jobs AS job
-               SET state = CASE WHEN job.state = 'queued' THEN 'analyzing' ELSE 'validating' END,
-                   payload = jsonb_set(job.payload, '{state}', to_jsonb(CASE WHEN job.state = 'queued' THEN 'analyzing'::text ELSE 'validating'::text END)),
+               SET state = CASE WHEN job.state = 'queued' THEN 'analyzing' ELSE 'verifying' END,
+                   payload = jsonb_set(job.payload, '{state}', to_jsonb(CASE WHEN job.state = 'queued' THEN 'analyzing'::text ELSE 'verifying'::text END)) || CASE WHEN job.state = 'queued' THEN jsonb_build_object('scan_lease_until', extract(epoch from now()) + 120) ELSE '{}'::jsonb END,
                    updated_at = now()
                FROM candidate WHERE job.id = candidate.id
                RETURNING job.id::text, job.payload"""
@@ -92,7 +94,7 @@ def claim_repair_generation() -> tuple[str, dict] | None:
             """SELECT id::text, payload FROM public.patchguard_jobs
                WHERE expires_at > now()
                  AND payload->'repair_operation'->>'status' = 'queued'
-                 AND payload->'repair_operation'->>'stage' = 'queued for generation'
+                 AND payload->'repair_operation'->>'stage' IN ('queued for generation', 'queued for deep repair')
                ORDER BY updated_at LIMIT 1 FOR UPDATE SKIP LOCKED"""
         ).fetchone()
         if not row:
@@ -220,7 +222,8 @@ def finish_repair(job_id: str, operation_id: str, candidate_id: str, checks: dic
         if not row:
             return False
         job = row[0]
-        ready = checks.get("verification_outcome") in ("verified", "partially_verified")
+        checks["verification_outcome"] = verification_outcome(checks)
+        ready = checks["verification_outcome"] in ("verified", "partially_verified")
         state = "review_ready" if ready else "verification_failed"
         job["repair"].update(checks=checks, state=state)
         for proposal in job.get("proposals", []):
@@ -287,3 +290,44 @@ def delete_expired_jobs() -> None:
         conn.execute("DELETE FROM public.patchguard_jobs WHERE expires_at <= now()")
 
 
+
+
+@contextmanager
+def locked_job(job_id: str, owner_id: str | None = None):
+    """Serialize a bounded job mutation without replacing unrelated newer fields."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT payload FROM public.patchguard_jobs WHERE id = %s AND expires_at > now() "
+            "AND (%s::text IS NULL OR payload->>'owner_id' = %s) FOR UPDATE",
+            (job_id, owner_id, owner_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("Job not found or expired")
+        job = row[0]
+        yield job
+        conn.execute("UPDATE public.patchguard_jobs SET state = %s, payload = %s::jsonb, updated_at = now() WHERE id = %s",
+                     (job["state"], json.dumps(job), job_id))
+
+
+def update_job_fields(job_id: str, changes: dict, expected_state: str | None = None) -> dict:
+    with locked_job(job_id) as job:
+        if expected_state and job.get("state") != expected_state:
+            raise RuntimeError("Job ownership expired; start a new scan.")
+        job.update(changes)
+        return job
+
+
+def renew_scan_lease(job_id: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE public.patchguard_jobs SET payload = jsonb_set(payload, '{scan_lease_until}', to_jsonb(%s::double precision)) "
+                     "WHERE id = %s AND state = 'analyzing' AND expires_at > now()", (time.time() + 120, job_id))
+
+
+def recover_scans() -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE public.patchguard_jobs SET state = 'failed', payload = payload || %s::jsonb, updated_at = now() "
+            "WHERE state = 'analyzing' AND COALESCE((payload->>'scan_lease_until')::double precision, "
+            "extract(epoch from updated_at) + 120) < extract(epoch from now())",
+            (json.dumps({"state": "failed", "error": "The scan worker stopped before finishing. Upload the project again to retry.", "progress": "Scan interrupted"}),),
+        )

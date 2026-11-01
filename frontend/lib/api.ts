@@ -1,29 +1,30 @@
-export type Severity = "critical" | "high" | "medium" | "low" | "informational";
-export type Repo = { id: string; name: string; branch: string; lastScan: string; findings: number; provider: "Upload"; private: true };
-export type Scan = { id: string; repo: string; branch: string; pr: number; status: "Passed" | "Needs attention" | "Running" | "Failed"; time: string; findings: number; jobId: string; state: string };
-export type Finding = { id: string; jobId: string; title: string; severity: Severity; tool: string; file: string; line: number; status: string; cwe: string; description: string; evidence: string };
+export type Severity = "critical" | "high" | "medium" | "low" | "informational" | "unassessed";
+export type Repo = { id: string; name: string; branch: string; lastScan: string; findings: number; provider: "Upload" | "GitHub"; private: boolean };
+export type Scan = { id: string; repo: string; branch: string; pr: number; status: "No findings reported" | "Needs attention" | "Running" | "Failed" | "Partial" | "Not verified"; time: string; findings: number; jobId: string; state: string };
+export type Finding = { id: string; jobId: string; title: string; severity: Severity; tool: string; file: string; line: number; status: string; cwe: string; description: string; evidence: string; analyzerSeverity: string };
 export type Patch = { id: string; findingId: string; explanation: string; diff: string; file: string; provider: string; state: string; metadata?: {line:number; added_lines:number; deleted_lines:number; reasons:string[]; security_improvement:string; warnings:string[]} };
 export type FindingExplanation = { summary: string; impact: string; recommended_action: string; provider_used: string };
 export type BuildDiagnostic = {category:string; file:string; line:number; column:number; message:string; source:"original"|"proposed"};
 export type RepairChecks = { [key:string]:string|boolean|BuildDiagnostic[]|undefined; details?:string; security_details?:string; build_diagnostics?:BuildDiagnostic[]; baseline_shared_dependency?:boolean; verification_outcome?:string};
 export type GitHubRepository = { full_name: string; default_branch: string; description?: string | null; updated_at?: string };
-export type Job = { id: string; name: string; provider: string; state: string; created_at: number; progress?: string; findings?: any[]; checks?: Record<string, string>; error?: string; report?: any; repair?: any; source_files?: number; uploaded_files?: string[]; source?: { type: "github"; repository: string; branch: string; commit_sha: string } };
+export type AnalysisReport = { scan_status?: "COMPLETED" | "PARTIAL" | "FAILED"; analyzer_status?: Record<string, {status:string; error?:string|null}>; [key:string]:any };
+export type Job = { id: string; name: string; provider: string; state: string; created_at: number; progress?: string; findings?: any[]; checks?: Record<string, string>; error?: string; report?: AnalysisReport; repair?: any; source_files?: number; uploaded_files?: string[]; source?: { type: "github"; repository: string; branch: string; commit_sha: string } };
 export type Dashboard = { open: number; critical: number; scanned: number; fixed: number; scans: Scan[]; findings: Finding[]; bySeverity: Record<Severity, number> };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...init?.headers }, cache: "no-store" });
+  const response = await fetch(`/api${path}`, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...init?.headers }, cache: "no-store", signal: init?.signal || AbortSignal.timeout(210_000) });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     const detail = payload.detail;
     const message = typeof detail === "string" ? detail : detail?.message || detail?.user_message || (detail?.code ? `The repair could not be matched safely (${detail.code.replaceAll("_", " ")}). Check the source preview and repair status for details.` : `Request failed (${response.status}).`);
     throw new Error(message);
   }
-  return response.json() as Promise<T>;
+  return response.json().catch(() => { throw new Error("The server returned an unreadable response. Retry the request."); }) as Promise<T>;
 }
 
 export const getJobs = () => request<Job[]>("/jobs?limit=100");
 export const getJob = (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`);
-export const getGitHubRepositories = (providerToken: string) => request<{ repositories: GitHubRepository[] }>("/github/repositories", { method: "POST", body: JSON.stringify({ provider_token: providerToken }) });
+export const getGitHubRepositories = (providerToken: string, page = 1) => request<{ repositories: GitHubRepository[]; next_page: number | null }>("/github/repositories", { method: "POST", body: JSON.stringify({ provider_token: providerToken, page }) });
 export const scanGitHubRepository = (providerToken: string, fullName: string) => request<{ id: string; state: string; expires_in_seconds: number }>("/github/scan", { method: "POST", body: JSON.stringify({ provider_token: providerToken, full_name: fullName }) });
 export const getFiles = (id: string) => request<{ files: string[] }>(`/jobs/${encodeURIComponent(id)}/files`);
 export const getProviders = () => request<{ providers: Record<string, { configured: boolean; available?: boolean; model_available?: boolean; model?: string; deep_model?:string; label?: string }> }>("/providers");
@@ -34,7 +35,16 @@ export function createScan(files: FileList | File[], onProgress: (percent: numbe
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/jobs");
     xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100)); };
-    xhr.onload = () => { const payload = JSON.parse(xhr.responseText || "{}"); if (xhr.status >= 200 && xhr.status < 300) resolve(payload); else reject(new Error(payload.detail || `Upload failed (${xhr.status})`)); };
+    xhr.timeout = 120_000;
+    xhr.onload = () => {
+      let payload: {id?:string;state?:string;expires_in_seconds?:number;detail?:unknown};
+      try { payload = JSON.parse(xhr.responseText || "{}"); }
+      catch { reject(new Error(`Upload failed (${xhr.status}). The server returned an unreadable response.`)); return; }
+      if (xhr.status >= 200 && xhr.status < 300 && payload.id && payload.state) resolve(payload as {id:string;state:string;expires_in_seconds:number});
+      else reject(new Error(typeof payload.detail === "string" ? payload.detail : `Upload failed (${xhr.status}). Check the file and retry.`));
+    };
+    xhr.ontimeout = () => reject(new Error("Upload timed out. Check your connection and retry."));
+    xhr.onabort = () => reject(new Error("Upload cancelled."));
     xhr.onerror = () => reject(new Error("Upload failed. Check your connection and retry."));
     xhr.send(body);
   });
@@ -54,22 +64,30 @@ export async function getFindingForJob(jobId: string, id: string): Promise<Findi
   return { ...mapFinding({ id: jobId } as Job, raw), source_lines: raw.source_lines, source_start_line: raw.source_start_line, job_id: jobId };
 }
 function mapFinding(job: Job, finding: any): Finding {
-  return { id: finding.id, jobId: job.id, title: finding.message, severity: finding.severity || "informational", tool: finding.source_tools?.join(", ") || finding.source_tool || "Static analysis", file: finding.file, line: finding.line, status: finding.status || "open", cwe: finding.cwe?.id || "Unmapped", description: finding.message, evidence: finding.evidence || finding.message };
+  return { id: finding.id, jobId: job.id, title: finding.message, severity: normalizeSeverity(finding.severity), analyzerSeverity: finding.severity || "unknown", tool: finding.source_tools?.join(", ") || finding.source_tool || "Static analysis", file: finding.file, line: finding.line, status: finding.status || "open", cwe: finding.cwe?.id || "Unmapped", description: finding.message, evidence: finding.evidence || finding.message };
+}
+export function normalizeSeverity(value: string): Severity {
+  return ["critical", "high", "medium", "low", "informational"].includes(value) ? value as Severity : "unassessed";
+}
+export function scanStatus(job: Job): Scan["status"] {
+  if (job.state === "failed" || job.report?.scan_status === "FAILED") return "Failed";
+  if (["queued", "analyzing", "validating", "verifying"].includes(job.state)) return "Running";
+  if (job.report?.scan_status === "PARTIAL") return "Partial";
+  if (job.report?.scan_status !== "COMPLETED") return "Not verified";
+  return job.findings?.some(finding => finding.status !== "false_positive") ? "Needs attention" : "No findings reported";
 }
 function mapScan(job: Job): Scan {
-  const findings = job.findings || [];
-  const needsAttention = findings.some((finding) => finding.status !== "false_positive");
-  return { id: job.id, jobId: job.id, repo: job.name || "Uploaded project", branch: "Uploaded source", pr: 0, status: job.state === "complete" ? needsAttention ? "Needs attention" : "Passed" : job.state === "failed" ? "Failed" : "Running", time: new Date(job.created_at * 1000).toLocaleString(), findings: findings.length, state: job.state };
+  return { id: job.id, jobId: job.id, repo: job.name || "Uploaded project", branch: job.source?.branch || "Uploaded source", pr: 0, status: scanStatus(job), time: new Date(job.created_at * 1000).toLocaleString(), findings: job.findings?.length || 0, state: job.state };
 }
 export async function getScans(): Promise<Scan[]> { return (await getJobs()).map(mapScan); }
 export async function getRepos(): Promise<Repo[]> {
-  return (await getJobs()).map((job) => ({ id: job.id, name: job.name || "Uploaded project", branch: "Upload", lastScan: job.state, findings: job.findings?.length || 0, provider: "Upload", private: true }));
+  return (await getJobs()).map((job) => ({ id: job.id, name: job.name || "Uploaded project", branch: job.source?.branch || "Upload", lastScan: scanStatus(job), findings: job.findings?.length || 0, provider: job.source ? "GitHub" : "Upload", private: !job.source }));
 }
 export async function getDashboard(): Promise<Dashboard> {
   const jobs = await getJobs();
   const findings = jobs.flatMap((job) => (job.findings || []).map((finding) => mapFinding(job, finding)));
   const open = findings.filter((finding) => finding.status === "open");
-  const severities: Severity[] = ["critical", "high", "medium", "low", "informational"];
+  const severities: Severity[] = ["critical", "high", "medium", "low", "informational", "unassessed"];
   return { open: open.length, critical: open.filter((finding) => finding.severity === "critical").length, scanned: jobs.length, fixed: jobs.filter((job) => job.repair?.state === "applied_to_copy").length, scans: jobs.slice(0, 8).map(mapScan), findings, bySeverity: Object.fromEntries(severities.map((severity) => [severity, open.filter((finding) => finding.severity === severity).length])) as Record<Severity, number> };
 }
 export const getPatch = (jobId: string, findingId: string, mode: "standard"|"deep" = "standard") => request<{id:string; operation_id:string; finding_id:string; state:string; status:string}>(`/jobs/${jobId}/repair/${findingId}?mode=${mode}`, { method: "POST" });

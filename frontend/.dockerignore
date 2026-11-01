@@ -4,3 +4,6 @@ dist
 out
 *.tsbuildinfo
 npm-debug.log
+test-results
+playwright-report
+tests

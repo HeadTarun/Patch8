@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import contextmanager
 import auth
 import providers
 
@@ -29,6 +30,19 @@ def request_for(user_id: str) -> Request:
     return Request({"type": "http", "method": "POST", "path": "/", "query_string": b"",
                     "headers": [(b"cookie", f"patchguard_session={token}".encode())],
                     "server": ("test", 80), "client": ("127.0.0.1", 1234), "scheme": "http"})
+
+
+class JobTestCase(unittest.TestCase):
+    """API unit tests use an in-memory job; PostgreSQL locking has separate checks."""
+    def setUp(self):
+        @contextmanager
+        def memory_job(job_id, owner_id):
+            job = app._read_job(job_id, owner_id)
+            yield job
+            app._save_job(job)
+        self.job_lock = patch.object(app, "_locked_job", memory_job)
+        self.job_lock.start()
+        self.addCleanup(self.job_lock.stop)
 
 
 class AuthTests(unittest.TestCase):
@@ -120,8 +134,8 @@ class GitHubTests(unittest.TestCase):
             client.cookies.set("patchguard_session", auth.issue_session("demo-user", "demo@example.com"))
             response = client.post("/api/github/repositories", json={"provider_token": "provider-token"})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), {"repositories": [{"full_name": "demo/firmware", "default_branch": "main", "description": "Firmware", "updated_at": "2026-10-31T12:00:00Z"}]})
-        github_json.assert_called_once_with("/user/repos?visibility=public&sort=updated&per_page=100", "provider-token")
+        self.assertEqual(response.json(), {"next_page": None, "repositories": [{"full_name": "demo/firmware", "default_branch": "main", "description": "Firmware", "updated_at": "2026-10-31T12:00:00Z"}]})
+        github_json.assert_called_once_with("/user/repos?visibility=public&sort=updated&per_page=100&page=1", "provider-token")
 
     def test_snapshot_resolves_branch_to_commit_and_rejects_private_repositories(self):
         sha = "a" * 40
@@ -179,7 +193,7 @@ class GitHubTests(unittest.TestCase):
         headers = Message()
         headers["X-RateLimit-Remaining"] = "0"
         rate_limited = app.urllib.error.HTTPError("https://api.github.com/user/repos", 403, "rate limited", headers, None)
-        with patch.object(app.urllib.request, "urlopen", side_effect=rate_limited):
+        with patch.object(app.urllib.request.OpenerDirector, "open", side_effect=rate_limited):
             with self.assertRaises(app.HTTPException) as rate_limit:
                 app._github_request("/user/repos", "provider-token")
         self.assertEqual(rate_limit.exception.status_code, 429)
@@ -225,7 +239,7 @@ class InternalRepairTests(unittest.TestCase):
 
     def test_deep_repair_is_available_after_failure_and_shares_attempt_limit(self):
         job_id, finding_id = "00000000-0000-0000-0000-000000000003", "finding-3"
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+        with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / job_id / "source"
             source.mkdir(parents=True)
@@ -250,10 +264,10 @@ class InternalRepairTests(unittest.TestCase):
         self.assertEqual(exhausted.exception.status_code, 409)
 
 
-class RepairAcceptanceTests(unittest.TestCase):
+class RepairAcceptanceTests(JobTestCase):
     def test_acceptance_records_author_and_verification_outcome(self):
         job_id, repair_id = "00000000-0000-0000-0000-000000000004", "00000000-0000-0000-0000-000000000005"
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+        with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / job_id / "source"
             source.mkdir(parents=True)
@@ -263,7 +277,7 @@ class RepairAcceptanceTests(unittest.TestCase):
             candidate.mkdir(parents=True)
             (candidate / "main.c").write_text("int value = 1;\n")
             repair = {"id": repair_id, "finding_id": "finding", "file": "main.c", "source_hash": hashlib.sha256(original.read_bytes()).hexdigest(),
-                      "candidate_hash": app._tree_hash(candidate), "state": "review_ready", "checks": {"verification_outcome": "verified"}}
+                      "candidate_hash": app._tree_hash(candidate), "state": "review_ready", "checks": {"verification_outcome": "verified", "build":"passed", "tests":"passed", "sanitizers":"passed", "security":"passed"}}
             repairs = root / job_id / "repairs"
             repairs.mkdir()
             (repairs / f"{repair_id}.json").write_text(json.dumps(repair))
@@ -278,7 +292,7 @@ class RepairAcceptanceTests(unittest.TestCase):
 
 class RepairContextTests(unittest.TestCase):
     def test_deep_context_is_wider_and_carries_verification_feedback(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+        with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             target = root / "main.c"
             target.write_text("".join(f"int item_{line};\n" for line in range(1, 301)))
@@ -292,7 +306,7 @@ class RepairContextTests(unittest.TestCase):
 
     def test_invalid_standard_attempt_stops_with_retry_available(self):
         job_id, finding_id = "00000000-0000-0000-0000-000000000006", "finding-6"
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+        with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / job_id / "source"
             source.mkdir(parents=True)
@@ -322,24 +336,21 @@ class RepairContextTests(unittest.TestCase):
 
 
 
-class TargetedRepairTests(unittest.TestCase):
-    def test_three_rejected_suggestions_require_human_review(self):
+class TargetedRepairTests(JobTestCase):
+    def test_final_rejected_suggestion_requires_human_review(self):
         job_id = "00000000-0000-0000-0000-000000000010"
         finding = {"id":"f", "file":"main.c", "line":1, "message":"null dereference", "mapping_confidence":"high", "cwe":{"id":"CWE-476"}}
-        job = {"id":job_id, "owner_id":"owner-a", "state":"complete", "provider":"ollama", "findings":[finding]}
+        job = {"id":job_id, "owner_id":"owner-a", "state":"complete", "provider":"ollama", "findings":[finding],
+               "repair_operation":{"id":"op", "finding_id":"f", "deadline":time.time()+180}}
         proposal = providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=1, end_line=1, original="not present", replacement="fixed", reason="fix")], explanation="fix", security_improvement="safe")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / job_id / "source"
             source.mkdir(parents=True)
-            (source / "main.c").write_text("int x;\n")
-            with patch.dict(os.environ, {"AUTH_SECRET":"a"*64}), patch.object(app, "JOBS_ROOT", root), patch.object(app, "get_job", return_value=job), patch.object(app, "recover_repairs"), patch.object(app, "begin_repair", return_value=True), patch.object(app, "reserve_repair_attempt", side_effect=[1,2,3]) as reserve, patch.object(app, "update_repair_operation") as update, patch.object(app, "generate_with_provider", return_value=(proposal,"ollama")) as generate:
-                client = TestClient(app.app)
-                client.cookies.set("patchguard_session", auth.issue_session("owner-a","a@example.com"))
-                response = client.post(f"/api/jobs/{job_id}/repair/f")
-            self.assertEqual(response.status_code, 422)
-            self.assertEqual(generate.call_count, 3)
-            self.assertEqual(reserve.call_count, 3)
+            (source / "main.c").write_bytes(b"int x;\n")
+            with patch.object(worker, "JOBS_ROOT", root), patch.object(worker, "reserve_repair_attempt", return_value=3), patch.object(worker, "update_repair_operation") as update, patch.object(worker, "_generate_with_deadline", return_value=(proposal,"ollama","model")) as generate:
+                worker.generate_repair(job_id, job)
+            self.assertEqual(generate.call_count, 1)
             self.assertEqual(update.call_args.args[2]["status"], "human_review")
             self.assertEqual((source / "main.c").read_text(), "int x;\n")
 
@@ -358,7 +369,7 @@ class TargetedRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / job_id / "source"
             source.mkdir(parents=True)
-            (source / "main.c").write_text("int x;\n")
+            (source / "main.c").write_bytes(b"int x;\n")
             with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temp)), patch.object(app, "get_job", return_value=job):
                 client = TestClient(app.app)
                 client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
@@ -391,7 +402,7 @@ class TargetedRepairTests(unittest.TestCase):
         self.assertEqual(after, "int a(){return 0;}\r\nint b(){return 1;}\r\n")
         edit["start_line"] = 1
         edit["end_line"] = 1
-        with self.assertRaisesRegex(ValueError, "text_mismatch"):
+        with self.assertRaisesRegex(ValueError, "missing_context"):
             app._validate_edits(before, [edit], 0, len(before))
 
     def test_mixed_line_endings_and_indent_mismatch_rejected(self):
@@ -401,7 +412,7 @@ class TargetedRepairTests(unittest.TestCase):
             app._validate_edits(source, [edit], 0, len(source))
         source = "int a;\n int b;\n"
         edit["original"] = "  int b;"
-        with self.assertRaisesRegex(ValueError, "text_mismatch"):
+        with self.assertRaisesRegex(ValueError, "missing_context"):
             app._validate_edits(source, [edit], 0, len(source))
 
     def test_verification_uses_fresh_copy_after_build_mutates_files(self):
@@ -432,44 +443,39 @@ class TargetedRepairTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app._validate_edits(before, [edit], 19, len(before))
 
-    def test_retry_apply_and_preserve_existing_copy(self):
+    def test_queued_repair_apply_and_preserve_existing_copy(self):
         job_id = "00000000-0000-0000-0000-000000000003"
-        finding_id = "finding-3"
         source = "int read_value(int *p) { return *p; }\n"
+        finding = {"id":"f", "file":"main.c", "line":1, "message":"null dereference", "mapping_confidence":"high", "cwe":{"id":"CWE-476"}}
+        job = {"id":job_id, "owner_id":"owner-a", "state":"complete", "provider":"auto", "findings":[finding]}
+        proposal = providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=1, end_line=1, original=source, replacement="int read_value(int *p) { return p ? *p : 0; }\n", reason="check pointer")], explanation="Check pointer", security_improvement="Avoid null dereference")
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source_dir = root / job_id / "source"
-            source_dir.mkdir(parents=True)
+            root = Path(temp); source_dir = root / job_id / "source"; source_dir.mkdir(parents=True)
             (source_dir / "main.c").write_bytes(source.encode())
-            finding = {"id": finding_id, "file":"main.c", "line":1, "message":"null dereference", "mapping_confidence":"high", "cwe":{"id":"CWE-476"}}
-            job = {"id":job_id, "owner_id":"owner-a", "state":"complete", "provider":"auto", "findings":[finding]}
-            def proposal(original):
-                return providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=1, end_line=1, original=original, replacement="return p ? *p : 0;", reason="check pointer")], explanation="Check pointer", security_improvement="Avoid null dereference")
-            with patch.dict(os.environ, {"AUTH_SECRET":"a" * 64}), patch.object(app, "JOBS_ROOT", root), patch.object(app, "get_job", return_value=job), patch.object(app, "_save_job"), patch.object(app, "begin_repair", return_value=True), patch.object(app, "recover_repairs"), patch.object(app, "reserve_repair_attempt", side_effect=[1, 2, 3]), patch.object(app, "update_repair_operation", return_value=True), patch.object(app, "enqueue_repair", side_effect=lambda jid, opid, repair, proposal: job.update(repair=repair, proposals=[proposal]) or True), patch.object(app, "generate_with_provider", side_effect=[(proposal("missing"), "ollama"), (proposal("return *p;"), "ollama")]) as generate:
-                client = TestClient(app.app)
-                client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
-                response = client.post(f"/api/jobs/{job_id}/repair/{finding_id}")
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(generate.call_count, 2)
-                self.assertEqual(generate.call_args_list[1].args[0], "ollama")
-                repair_id = response.json()["id"]
-                job["repair"]["state"] = "review_ready"
-                job["repair"]["checks"]["verification_outcome"] = "verified"
-                (source_dir / "main.c").write_text("changed")
-                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
-                (source_dir / "main.c").write_bytes(source.encode())
-                job["repair"]["checks"]["verification_outcome"] = "failed"
-                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
-                job["repair"]["checks"]["verification_outcome"] = "partially_verified"
-                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
-                job["repair"]["checks"]["verification_outcome"] = "verified"
-                applied = client.post(f"/api/jobs/{job_id}/apply/{repair_id}?confirm_human_review=true")
-                self.assertEqual(applied.status_code, 200, applied.text)
-                self.assertEqual((source_dir / "main.c").read_bytes(), source.encode())
-                patched = root / job_id / "patched" / "main.c"
-                self.assertIn("p ? *p : 0", patched.read_text())
-                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
-                self.assertTrue(patched.exists())
+            def begin(jid, owner, operation):
+                job["repair_operation"] = operation
+                return True
+            with patch.dict(os.environ, {"AUTH_SECRET":"a"*64}), patch.object(app,"JOBS_ROOT",root), patch.object(worker,"JOBS_ROOT",root), patch.object(app,"get_job",return_value=job), patch.object(app,"_save_job"), patch.object(app,"recover_repairs"), patch.object(app,"begin_repair",side_effect=begin), patch.object(worker,"reserve_repair_attempt",return_value=1), patch.object(worker,"update_repair_operation",return_value=True), patch.object(worker,"_generate_with_deadline",return_value=(proposal,"ollama","model")), patch.object(worker,"enqueue_repair",side_effect=lambda jid,opid,repair,summary: job.update(repair=repair,proposals=[summary]) or True):
+                client = TestClient(app.app); client.cookies.set("patchguard_session", auth.issue_session("owner-a","a@example.com"))
+                queued = client.post(f"/api/jobs/{job_id}/repair/f")
+                self.assertEqual(queued.status_code,202,queued.text)
+                self.assertNotIn("repair",job)
+                worker.generate_repair(job_id,job)
+                repair_id=job["repair"]["id"]
+                job["repair"].update(state="review_ready", checks={key:"passed" for key in ("build","tests","sanitizers","security")})
+                (source_dir/"main.c").write_text("changed")
+                url=f"/api/jobs/{job_id}/apply/{repair_id}?confirm_human_review=true"
+                self.assertEqual(client.post(url).status_code,409)
+                (source_dir/"main.c").write_bytes(source.encode())
+                job["repair"]["checks"]["security"]="unverified"
+                self.assertEqual(client.post(url+"&confirm_partial=true").status_code,409)
+                job["repair"]["checks"]["security"]="passed"
+                applied=client.post(url)
+                self.assertEqual(applied.status_code,200,applied.text)
+                self.assertEqual((source_dir/"main.c").read_bytes(),source.encode())
+                self.assertIn("p ? *p : 0",(root/job_id/"patched"/"main.c").read_text())
+                self.assertEqual(client.post(url).status_code,409)
+
 
 class TaxonomyTests(unittest.TestCase):
     def test_only_requested_cwes_are_supported(self):
@@ -554,7 +560,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result["properties"]["classification"], "SUSPICIOUS_CANDIDATE")
 
 
-class ApiTests(unittest.TestCase):
+class ApiTests(JobTestCase):
     def test_health_exposes_only_selected_cwes(self):
         client = TestClient(app.app)
         self.assertEqual(client.get("/api/health").json()["analyzers"], ["Clang Static Analyzer", "Cppcheck", "Semgrep"])
@@ -713,7 +719,7 @@ class ArchiveTests(unittest.TestCase):
                 archive.writestr("firmware/main.h", "int read_sensor(void);\n")
             target = base / "output"
             safe_extract(source_zip, target)
-            self.assertTrue((target / "firmware" / "main.h").is_file())
+            self.assertTrue((target / "main.h").is_file())
 
 
 class RepairValidationTests(unittest.TestCase):

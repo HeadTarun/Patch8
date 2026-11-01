@@ -6,3 +6,8 @@ frontend/dist/
 frontend/.next/
 frontend/out/
 frontend/*.tsbuildinfo
+.test-work/
+
+.*.log
+frontend/test-results/
+frontend/playwright-report/

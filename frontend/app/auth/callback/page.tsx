@@ -16,13 +16,15 @@ export default function AuthCallback() {
   const [loadingRepositories, setLoadingRepositories] = useState(false);
   const [busyRepo, setBusyRepo] = useState("");
   const started = useRef(false);
+  const [nextPage, setNextPage] = useState<number | null>(null);
 
-  async function loadRepositories(token: string) {
+  async function loadRepositories(token: string, page = 1) {
     setLoadingRepositories(true);
     setError("");
     try {
-      const result = await getGitHubRepositories(token);
-      setRepositories(result.repositories);
+      const result = await getGitHubRepositories(token, page);
+      setRepositories(current => page === 1 ? result.repositories : [...current, ...result.repositories.filter(repo => !current.some(existing => existing.full_name === repo.full_name))]);
+      setNextPage(result.next_page);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not load your public GitHub repositories.");
     } finally {
@@ -125,6 +127,7 @@ export default function AuthCallback() {
         {githubFlow && <div className="status-pill"><Github size={13} /> Public repository access is read-only</div>}
         <div className="status-pill"><ShieldCheck size={13} /> Session uses a secure, HTTP-only cookie</div>
       </section>
+      {nextPage && !busyRepo && <button className="button" disabled={loadingRepositories} onClick={() => void loadRepositories(providerToken, nextPage)}>Load more repositories</button>}
     </main>
   );
 }

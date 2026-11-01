@@ -264,7 +264,7 @@ def sarif_report(job_id: str, findings: list[dict]) -> dict:
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": "PatchGuard", "informationUri": "https://cwe.mitre.org/", "rules": rules}},
+            "tool": {"driver": {"name": "Patch8", "informationUri": "https://cwe.mitre.org/", "rules": rules}},
             "taxonomies": [{"name": "CWE", "version": "5.0", "informationUri": "https://cwe.mitre.org/", "taxa": [{"id": item, "name": get_weakness(item)["name"], "helpUri": get_weakness(item)["url"]} for item in cwe_ids]}],
             "results": results,
         }],

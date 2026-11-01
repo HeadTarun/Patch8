@@ -1,12 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { ArrowLeft, CircleAlert, CircleCheck, Clock3, Download, FileCode2, LoaderCircle, RefreshCw, ShieldCheck } from "lucide-react";
 import { AppShell } from "@/components/app-shell";
 import { CodePreview } from "@/components/code-preview";
 import { FindingActions } from "@/components/finding-actions";
 import { EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
-import { getFiles, getJob, getProjectSource, getRepairStatus, type Job, type RepairOperation } from "@/lib/api";
+import { getFiles, getJob, getProjectSource, getRepairStatus, scanStatus, normalizeSeverity, type Job, type RepairOperation } from "@/lib/api";
 
 type RepairStatus = Awaited<ReturnType<typeof getRepairStatus>>;
 const lifecycleSteps = ["Upload", "Scan", "Findings", "Repair", "Verification", "Review"];
@@ -37,8 +37,8 @@ function LifecycleRoadmap({job, status}:{job:Job; status:RepairStatus|null}) {
     current=2;warning=2;
   }
   const scanDone=["complete","validating","verifying"].includes(job.state)||current>1||completeAll;
-  const titles=["Files received",job.state==="failed"?"Scan failed":scanDone?"Scan complete":job.state==="analyzing"?"Scanning":"Queued",
-    findings.length?`${findings.length} finding${findings.length===1?"":"s"}`:"No findings",
+  const titles=["Files received",scanDone||job.state==="failed"?scanStatus(job):job.state==="analyzing"?"Scanning":"Queued",
+    findings.length?`${findings.length} finding${findings.length===1?"":"s"}`:job.report?.scan_status==="COMPLETED"?"No findings reported":"Coverage incomplete",
     operation?.status==="timed_out"?"Timed out":operation?.status==="human_review"?"Human review":current>3?"Candidate ready":operation?.stage||"Waiting for review",
     repair?.checks?.verification_outcome||job.checks?.verification||"Pending checks",
     repair?.state==="applied_to_copy"?"Accepted":repair?.state==="review_ready"?"Ready to review":"Pending review"];
@@ -74,18 +74,27 @@ export default function Analysis() {
   const [sourceError,setSourceError]=useState("");
   const [loading,setLoading]=useState(true);
   const [error,setError]=useState("");
-  async function refresh(){
-    try{const value=await getJob(jobId);setJob(value);const tree=await getFiles(jobId);setFiles(tree.files);setSourcePath(current=>current||tree.files.find(path=>sourceExtension.test(path))||"");setError("");}
-    catch(reason){setError(reason instanceof Error?reason.message:"Could not load scan.");}
-    finally{setLoading(false);}
-  }
-  async function refreshRepair(){try{setRepairStatus(await getRepairStatus(jobId));}catch{}}
-  useEffect(()=>{setLoading(true);setJob(null);setFiles([]);setSourcePath("");setRepairStatus(null);setError("");void refresh();void refreshRepair();},[jobId]);
+  const generation=useRef(0);
+  const refresh=useCallback(async()=>{
+    const current=generation.current;
+    try{const value=await getJob(jobId);if(current!==generation.current)return;setJob(value);const tree=await getFiles(jobId);if(current!==generation.current)return;setFiles(tree.files);setSourcePath(path=>path||tree.files.find(path=>sourceExtension.test(path))||"");setError("");}
+    catch(reason){if(current===generation.current)setError(reason instanceof Error?reason.message:"Could not load scan.");}
+    finally{if(current===generation.current)setLoading(false);}
+  },[jobId]);
+  const refreshRepair=useCallback(async()=>{const current=generation.current;try{const result=await getRepairStatus(jobId);if(current===generation.current)setRepairStatus(result);}catch(reason){if(current===generation.current)setError(reason instanceof Error?reason.message:"Could not refresh repair status.");}},[jobId]);
+  useEffect(()=>{const current=++generation.current;setLoading(true);setJob(null);setFiles([]);setSourcePath("");setRepairStatus(null);setError("");void refresh();void refreshRepair();return()=>{generation.current=current+1};},[jobId,refresh,refreshRepair]);
+  const jobState=job?.state;
   useEffect(()=>{
-    if(!job||!["queued","analyzing","validating","verifying"].includes(job.state))return;
-    const timer=window.setInterval(()=>void refresh(),2500);return()=>window.clearInterval(timer);
-  },[jobId,job?.state]);
-  useEffect(()=>{const timer=window.setInterval(()=>void refreshRepair(),2000);return()=>window.clearInterval(timer);},[jobId]);
+    if(!jobState||!["queued","analyzing","validating","verifying"].includes(jobState))return;
+    let stopped=false;let timer:ReturnType<typeof setTimeout>;
+    async function poll(){await refresh();if(!stopped)timer=setTimeout(poll,2500)}
+    timer=setTimeout(poll,2500);return()=>{stopped=true;clearTimeout(timer)};
+  },[refresh,jobState]);
+  useEffect(()=>{
+    let stopped=false;let timer:ReturnType<typeof setTimeout>;
+    async function poll(){await refreshRepair();if(!stopped)timer=setTimeout(poll,3000)}
+    timer=setTimeout(poll,3000);return()=>{stopped=true;clearTimeout(timer)};
+  },[refreshRepair]);
   useEffect(()=>{
     let active=true;setSourceText("");setSourceError("");
     if(!sourcePath)return;
@@ -99,7 +108,7 @@ export default function Analysis() {
       {job.state==="failed"&&<div className="panel error-state" role="alert"><h2>Scan failed</h2><p>{job.error||"The analysis worker could not complete this scan."}</p></div>}
       <div className="stats-grid"><article className="panel stat-card"><div className="stat-label">Findings</div><div className="stat-value">{job.findings?.length??"—"}</div></article><article className="panel stat-card"><div className="stat-label">Source files</div><div className="stat-value">{job.source_files??files.length}</div></article><article className="panel stat-card"><div className="stat-label">Analysis status</div><div className="stat-value" style={{fontSize:18}}>{job.report?.scan_status||job.state}</div></article><article className="panel stat-card"><div className="stat-label">Patch checks</div><div className="stat-value" style={{fontSize:18}}>{job.checks?.verification||"Not run"}</div></article></div>
       <LifecycleRoadmap job={job} status={repairStatus}/>
-      <section className="panel list-panel section-gap"><div className="panel-head"><h2><ShieldCheck size={16}/> Findings</h2><span className="tag">{job.findings?.length??0}</span></div>{job.findings?.length?<div className="grid gap-2">{job.findings.map(finding=><div key={finding.id}><a className="repo-card panel" href={`/app/findings/${finding.id}?job=${job.id}`}><span className={`severity ${finding.severity}`}><i className="severity-dot"/>{finding.severity}</span><span className="repo-meta"><strong>{finding.message}</strong><span className="mono">{finding.file}:{finding.line} · {finding.source_tool} · {finding.cwe?.id||"unmapped"}</span></span><span className="tag">{finding.status||"open"}</span></a>{["complete","validating","verifying"].includes(job.state)&&<button className="button" onClick={()=>setSelected(finding.id)}>Review repair</button>}</div>)}</div>:job.state==="complete"?<EmptyState title="No findings reported" body="The completed scan reported no findings from the configured analyzers."/>:<LoadingState rows={2}/>}</section>
+      <section className="panel list-panel section-gap"><div className="panel-head"><h2><ShieldCheck size={16}/> Findings</h2><span className="tag">{job.findings?.length??0}</span></div>{job.findings?.length?<div className="grid gap-2">{job.findings.map(finding=><div key={finding.id}><a className="repo-card panel" href={`/app/findings/${finding.id}?job=${job.id}`}><span className={`severity ${normalizeSeverity(finding.severity)}`}><i className="severity-dot"/>{normalizeSeverity(finding.severity)==="unassessed"?"Not assessed":normalizeSeverity(finding.severity)}</span><span className="repo-meta"><strong>{finding.message}</strong><span className="mono">{finding.file}:{finding.line} · {finding.source_tool} · {finding.cwe?.id||"unmapped"}</span></span><span className="tag">{finding.status||"open"}</span></a>{["complete","validating","verifying"].includes(job.state)&&<button className="button" onClick={()=>setSelected(finding.id)}>Review repair</button>}</div>)}</div>:job.state==="complete"?<EmptyState title={scanStatus(job)==="No findings reported"?"No findings reported":"Analysis coverage incomplete"} body={scanStatus(job)==="No findings reported"?"The configured analyzers completed and reported no findings.":"No findings were retained, but analysis did not complete successfully. Review analyzer diagnostics before drawing conclusions."}/>:<LoadingState rows={2}/>}</section>
       {selected&&job.findings?.find(f=>f.id===selected)&&<section className="panel detail-box section-gap"><FindingActions jobId={job.id} findingId={selected} eligible={!!job.findings.find(f=>f.id===selected)?.cwe&&job.findings.find(f=>f.id===selected)?.status!=="false_positive"}/></section>}
       <section className="panel source-browser section-gap"><div className="panel-head"><div><div className="eyebrow">UPLOADED PROJECT</div><h2>Source preview</h2></div><FileCode2 size={17} className="accent"/></div>
         {sourceFiles.length?<><label className="source-preview-select">Choose source file<select value={sourcePath} onChange={event=>setSourcePath(event.target.value)}>{sourceFiles.map(path=><option key={path} value={path}>{path}</option>)}</select></label>{sourceError?<p role="alert">{sourceError}</p>:sourceText?<CodePreview text={sourceText} label={`Source preview ${sourcePath}`}/>:<p className="muted">Loading source preview…</p>}</>:<p className="muted">Source files will be available here after the upload is extracted.</p>}

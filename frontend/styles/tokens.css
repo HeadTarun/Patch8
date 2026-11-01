@@ -1,0 +1,26 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0f17;
+  --panel: #111824;
+  --panel2: #151e2c;
+  --line: #29364a;
+  --line-strong: #3c5371;
+  --text: #e6edf7;
+  --muted: #9baac0;
+  --subtle-text: #c3d0e2;
+  --cyan: #65b5ff;
+  --cyan-dim: #14283e;
+  --violet: #a49bea;
+  --on-accent: #08131f;
+  --success: #83ddb0;
+  --success-bg: #142d28;
+  --danger: #ff8a9b;
+  --danger-bg: #301c29;
+  --warning: #edc776;
+  --warning-bg: #30291b;
+  --mono: "Geist Mono Variable", ui-monospace, monospace;
+  --sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --ink: var(--text);
+  --blue: var(--cyan);
+  --paper: var(--panel);
+}

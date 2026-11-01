@@ -1,8 +1,11 @@
-fastapi==0.120.4
+fastapi==0.140.12
+starlette==1.8.0
 pydantic==2.12.4
 uvicorn[standard]==0.38.0
-python-multipart==0.0.20
+python-multipart==0.0.31
 psycopg[binary]==3.2.10
 semgrep==1.183.0
 langchain-core==1.6.4
 langchain-ollama==1.1.0
+
+python-dotenv==1.2.2

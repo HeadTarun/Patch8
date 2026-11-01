@@ -6,3 +6,9 @@ frontend/node_modules
 frontend/dist
 data/cwe/*.zip
 work
+
+.test-work
+.*.log
+frontend/.next
+frontend/test-results
+frontend/playwright-report

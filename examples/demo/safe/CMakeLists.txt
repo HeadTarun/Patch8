@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(patch8_demo C)
+set(CMAKE_C_STANDARD 11)
+add_executable(demo main.c)
+enable_testing()
+add_test(NAME valid_pointer COMMAND demo)
+add_test(NAME null_pointer COMMAND demo --null)

@@ -7,7 +7,10 @@
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
     "build:legacy": "tsc -b && vite build --configLoader runner",
-    "start": "next start --hostname 0.0.0.0"
+    "start": "next start --hostname 0.0.0.0",
+    "lint": "eslint app components lib src",
+    "test:browser": "playwright test",
+    "typecheck": "tsc --project tsconfig.next.json --noEmit --incremental false && tsc --project tsconfig.json --noEmit"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.6",
@@ -21,15 +24,23 @@
     "react": "19.1.1",
     "react-dom": "19.1.1",
     "tailwind-merge": "^3.3.1",
-    "vite": "6.4.1"
+    "vite": "6.4.5"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.64.1",
     "@types/node": "^20.17.6",
     "@types/react": "19.1.13",
     "@types/react-dom": "19.1.9",
     "autoprefixer": "^10.4.22",
-    "postcss": "^8.5.6",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "postcss": "^8.5.18",
     "tailwindcss": "^3.4.18",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.72.1"
+  },
+  "overrides": {
+    "postcss": "$postcss"
   }
 }

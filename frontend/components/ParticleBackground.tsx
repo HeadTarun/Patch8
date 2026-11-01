@@ -7,7 +7,7 @@ type Particle = {
   offsetX: number; offsetY: number; radius: number; phase: number; color: string;
 };
 
-const colors = ["23,105,232", "36,145,184", "86,112,208", "122,99,194"];
+const colors = ["101,181,255", "77,193,215", "117,143,231", "164,155,234"];
 
 export function ParticleBackground() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -69,7 +69,7 @@ export function ParticleBackground() {
           const by = b.y + b.offsetY;
           const distance = Math.hypot(ax - bx, ay - by);
           if (distance >= linkDistance) continue;
-          context.strokeStyle = `rgba(45,112,195,${(1 - distance / linkDistance) * 0.23})`;
+          context.strokeStyle = `rgba(101,181,255,${(1 - distance / linkDistance) * 0.23})`;
           context.lineWidth = 0.7;
           context.beginPath();
           context.moveTo(ax, ay);

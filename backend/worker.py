@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 
 from db import (claim_job, claim_repair_generation, delete_expired_jobs, enqueue_repair,
                 finish_repair, get_job, recover_repairs, reserve_repair_attempt,
-                save_job, update_repair_operation)
+                save_job, update_repair_operation, update_job_fields, renew_scan_lease, recover_scans)
 from providers import generate_with_provider
 from taxonomy import get_weakness
 from app import (MAX_REPAIR_ATTEMPTS, REPAIR_GENERATION_TIMEOUT,
@@ -32,6 +32,8 @@ from app import (MAX_REPAIR_ATTEMPTS, REPAIR_GENERATION_TIMEOUT,
                  _repair_path, _tree_hash, _validate_edits)
 from analysis_pipeline import run_analysis, validate_analysis_mode
 from scanner import analyze
+from project_io import inspect_archive, normalize_project_root
+from verification import verification_outcome
 
 WORK_ROOT = Path(os.getenv("WORK_ROOT", str(Path(tempfile.gettempdir()) / "patchguard")))
 JOBS_ROOT = WORK_ROOT / "jobs"
@@ -137,12 +139,14 @@ def generate_repair(job_id: str, job: dict) -> None:
         weakness = get_weakness((finding.get("cwe") or {}).get("id", ""))
         if not weakness:
             raise ValueError("CWE mapping could not be loaded.")
-        context = _build_repair_context(before, finding, weakness, source_root, target)
+        context = _build_repair_context(before, finding, weakness, source_root, target, deep=operation.get("mode") == "deep", verification_feedback=json.dumps(job.get("checks") or {})[:12000])
     except Exception as exc:
         update_repair_operation(job_id, operation_id, {"status": "failed", "stage": "failed", "error": str(exc)[:500]})
         return
 
     attempts = list(operation.get("attempts", []))
+    if attempts:
+        context["retry_feedback"] = json.dumps(attempts[-1], ensure_ascii=False)[:12000]
     deadline = float(operation.get("deadline", time.time() + REPAIR_GENERATION_TIMEOUT))
     provider = "deep" if operation.get("mode") == "deep" else job.get("provider", "none")
     result = None
@@ -250,56 +254,19 @@ def generate_repair(job_id: str, job: dict) -> None:
 
 
 def update(job_id: str, **changes) -> dict:
-    job = get_job(job_id)
-    if not job:
-        return {}
-    job.update(changes)
-    save_job(job)
-    return job
+    return update_job_fields(job_id, changes, expected_state="analyzing")
 
 
 def safe_extract(archive_path: Path, target: Path) -> int:
-    total = 0
-    written = 0
     target.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive_path) as archive:
-        entries = archive.infolist()
-        if len(entries) > MAX_FILES:
-            raise ValueError(f"Archive has more than {MAX_FILES} entries.")
-        for entry in entries:
-            name = entry.filename.replace("\\", "/")
-            parts = PurePosixPath(name).parts
-            if not name or PurePosixPath(name).is_absolute() or name.startswith("/") or ".." in parts:
-                raise ValueError("Archive contains an unsafe path.")
-            if any(part in SKIP_DIRS for part in parts):
-                continue
-            mode = entry.external_attr >> 16
-            if stat.S_ISLNK(mode):
-                raise ValueError("Archive contains a symbolic link.")
-            if entry.is_dir():
-                continue
-            destination = (target / Path(*parts)).resolve()
-            if not destination.is_relative_to(target.resolve()):
-                raise ValueError("Archive contains an unsafe path.")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(entry) as source, destination.open("wb") as output:
-                while chunk := source.read(1024 * 1024):
-                    total += len(chunk)
-                    if total > MAX_EXTRACTED:
-                        raise ValueError(f"Expanded project exceeds {MAX_EXTRACTED // 1_000_000} MB.")
-                    output.write(chunk)
-            written += 1
-    if written == 0 or not any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS for path in target.rglob("*")):
-        raise ValueError("The ZIP archive must contain at least one C/C++ source file.")
-    # ZIPs commonly wrap their contents in one top-level directory.
-    children = list(target.iterdir())
-    if len(children) == 1 and children[0].is_dir() and not any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS - {".h", ".hh", ".hpp", ".hxx"} for path in children[0].rglob("*")):
-        nested = children[0]
-        if any(path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS - {".h", ".hh", ".hpp", ".hxx"} for path in nested.rglob("*")):
-            for child in nested.iterdir():
-                shutil.move(str(child), target / child.name)
-            nested.rmdir()
-    return written
+    try:
+        count = inspect_archive(archive_path, target=target, max_files=MAX_FILES, max_bytes=MAX_EXTRACTED,
+                                max_source=int(os.getenv("MAX_SOURCE_BYTES", "200000")))
+        normalize_project_root(target)
+        return count
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
 
 
 def _limits():
@@ -358,7 +325,7 @@ def _compile_database_flags(source: Path, file: Path) -> list[str]:
                             flags += [arg, str(include)]
                     index += 2
                     continue
-                if arg.startswith(("-D", "-U", "-std=", "-W", "-f", "-m")) or arg in {"-pthread", "-ansi"}:
+                if re.fullmatch(r"-(?:D[A-Za-z_][A-Za-z0-9_]*(?:=[A-Za-z0-9_+.-]+)?|U[A-Za-z_][A-Za-z0-9_]*|std=[A-Za-z0-9+.-]+|W[A-Za-z0-9-]+)", arg) or arg in {"-pthread", "-ansi", "-funsigned-char", "-fsigned-char", "-fshort-enums"}:
                     flags.append(arg)
                 index += 1
             return flags
@@ -498,6 +465,13 @@ def validate_build(job_dir: Path, source: Path, on_check=None, baseline_source: 
         if on_check:
             on_check("build", status)
         return result
+    # Make projects may write beside their sources. Give every build a disposable
+    # copy so project scripts cannot mutate the original or the reviewed candidate.
+    build_source = job_dir / "validation-source"
+    if build_source.exists():
+        shutil.rmtree(build_source)
+    shutil.copytree(source, build_source)
+    source = build_source
     result["details"] = "Build scripts run only inside bubblewrap with separate network, process, and filesystem namespaces."
     wrapped = sandbox_command(command, source, build)
     if not wrapped:
@@ -680,6 +654,15 @@ def process(job_id: str) -> None:
     job_dir = JOBS_ROOT / job_id
     original = job_dir / "upload.zip"
     source = job_dir / "source"
+    stop = threading.Event()
+    def heartbeat():
+        while not stop.wait(30):
+            try:
+                renew_scan_lease(job_id)
+            except Exception:
+                logging.warning("Could not renew scan lease for %s", job_id)
+    heart = threading.Thread(target=heartbeat, daemon=True)
+    heart.start()
     try:
         job = get_job(job_id) or {}
         update(job_id, state="analyzing", progress="Preparing source")
@@ -692,6 +675,7 @@ def process(job_id: str) -> None:
         elif job.get("upload_kind") == "project":
             shutil.copytree(job_dir / "upload-source", source)
             shutil.rmtree(job_dir / "upload-source", ignore_errors=True)
+            normalize_project_root(source)
         else:
             safe_extract(original, source)
             original.unlink(missing_ok=True)
@@ -708,9 +692,15 @@ def process(job_id: str) -> None:
             checks["performance"] = "baseline_ready"
         report.update({"taxonomy_version": "5.0", "schema_version": "8.0", "checks": checks, "performance_baseline": baseline, "evaluated_at": time.time()})
         progress = "Scan complete" if report["scan_status"] == "COMPLETED" else f"Scan {report['scan_status'].lower()}: review analyzer status"
-        update(job_id, state="complete", progress=progress, findings=report["findings"], report=report, checks=checks, performance_baseline=baseline, source_files=report["source_files"])
+        update(job_id, state="failed" if report["scan_status"] == "FAILED" else "complete", progress=progress, findings=report["findings"], report=report, checks=checks, performance_baseline=baseline, source_files=report["source_files"])
     except Exception as exc:
-        update(job_id, state="failed", progress="Scan failed", error=str(exc)[:500])
+        try:
+            update(job_id, state="failed", progress="Scan failed", error="Analysis could not finish. Check analyzer availability and retry the upload.")
+        except Exception:
+            logging.warning("Could not update interrupted scan %s", job_id)
+    finally:
+        stop.set()
+        heart.join(timeout=2)
 
 
 def validate_repair(job_id: str, job: dict | None = None) -> None:
@@ -788,12 +778,7 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
             else "passed" if all(checks.get(name) == "passed" for name in required_checks)
             else "unverified"
         )
-        available = [checks.get(name) for name in required_checks]
-        checks["verification_outcome"] = (
-            "failed" if "failed" in available else
-            "verified" if all(value == "passed" for value in available) else
-            "partially_verified" if "passed" in available or (checks.get("baseline_shared_dependency") and checks.get("build") == "not_available") else "not_verified"
-        )
+        checks["verification_outcome"] = verification_outcome(checks)
         finish_repair(job_id, operation_id, candidate_id, checks, performance)
     except Exception as exc:
         logging.exception("Candidate verification interrupted: %s", candidate_id)
@@ -811,6 +796,7 @@ def main() -> None:
     retry_delay = 5
     while True:
         try:
+            recover_scans()
             recover_repairs()
             repair_item = claim_repair_generation()
             item = None if repair_item else claim_job()

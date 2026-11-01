@@ -19,6 +19,7 @@ import uuid
 import zipfile
 import threading
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -27,8 +28,10 @@ from pydantic import BaseModel, Field
 
 from auth import issue_session, read_session, supabase_auth, supabase_user
 from db import (begin_repair, enqueue_repair, get_job, list_user_jobs, recover_repairs,
-                reserve_repair_attempt, save_job, update_repair_operation)
+                reserve_repair_attempt, save_job, update_repair_operation, locked_job)
 from providers import explain_with_provider, generate_with_provider
+from project_io import inspect_archive, safe_path, validate_text, ProjectInputError
+from verification import verification_outcome
 from scanner import sarif_report
 from taxonomy import catalog, get_weakness, supported_weaknesses
 from dotenv import load_dotenv
@@ -53,7 +56,17 @@ HEADER_EXTENSIONS = {".h", ".hh", ".hpp", ".hxx"}
 PROJECT_EXTENSIONS = SOURCE_EXTENSIONS | {".cmake", ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".mk", ".xml", ".sh", ".properties", ".gradle", ".bazel", ".bzl", ".make", ".conf"}
 PROJECT_FILENAMES = {"makefile", "cmakelists.txt", "dockerfile", "meson.build", "meson.options", "configure", "configure.ac", "readme", ".gitignore", ".editorconfig"}
 SKIP_UPLOAD_DIRS = {".git", "node_modules", "build", "dist", "vendor", "venv", ".venv", "__pycache__", "target"}
-app = FastAPI(title="PatchGuard", version="0.1.0", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json")
+app = FastAPI(title="Patch8", version="0.1.0", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json")
+
+@app.middleware("http")
+async def validate_browser_origin(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and origin:
+        allowed = {os.getenv("FRONTEND_URL", "http://localhost:8000").rstrip("/"), str(request.base_url).rstrip("/")}
+        if origin.rstrip("/") not in allowed:
+            return JSONResponse({"detail": "Request origin is not allowed."}, status_code=403)
+    return await call_next(request)
+
 
 class Credentials(BaseModel):
     email: str = Field(min_length=3, max_length=254)
@@ -66,6 +79,7 @@ class AuthCallback(BaseModel):
 
 class GitHubRepositoriesRequest(BaseModel):
     provider_token: str = Field(min_length=1, max_length=8192)
+    page: int = Field(default=1, ge=1, le=1000)
 
 
 class GitHubScanRequest(GitHubRepositoriesRequest):
@@ -175,6 +189,14 @@ def github_sign_in() -> RedirectResponse:
     return RedirectResponse(f"{base}/auth/v1/authorize?{params}", status_code=302)
 
 
+class GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = urllib.parse.urlsplit(newurl)
+        if destination.scheme != "https" or destination.hostname != "api.github.com" or destination.port not in (None, 443):
+            raise HTTPException(502, "GitHub returned an unexpected API location.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _github_request(path: str, token: str, max_bytes: int = 5_000_000) -> bytes:
     if not token or any(ord(character) < 33 or ord(character) > 126 for character in token):
         raise HTTPException(401, "GitHub authorization is missing. Sign in with GitHub again.")
@@ -188,7 +210,7 @@ def _github_request(path: str, token: str, max_bytes: int = 5_000_000) -> bytes:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.build_opener(GitHubRedirectHandler()).open(request, timeout=20) as response:
             host = urllib.parse.urlsplit(response.geturl()).hostname
             if host != "api.github.com":
                 raise HTTPException(502, "GitHub returned an unexpected API location.")
@@ -267,10 +289,10 @@ def _github_snapshot(provider_token: str, full_name: str) -> tuple[bytes, dict]:
 def github_repositories(payload: GitHubRepositoriesRequest, request: Request) -> dict:
     _current_user(request)
     _auth_rate_limit(request, "github_repositories", 60)
-    repositories = _github_json("/user/repos?visibility=public&sort=updated&per_page=100", payload.provider_token)
+    repositories = _github_json(f"/user/repos?visibility=public&sort=updated&per_page=100&page={payload.page}", payload.provider_token)
     if not isinstance(repositories, list):
         raise HTTPException(502, "GitHub returned an invalid repository list.")
-    return {"repositories": [
+    return {"next_page": payload.page + 1 if len(repositories) == 100 else None, "repositories": [
         {"full_name": item["full_name"], "default_branch": item["default_branch"], "description": item.get("description"), "updated_at": item.get("updated_at")}
         for item in repositories
         if isinstance(item, dict) and not item.get("private") and isinstance(item.get("full_name"), str) and isinstance(item.get("default_branch"), str) and item["full_name"] and item["default_branch"]
@@ -350,6 +372,16 @@ def _read_job(job_id: str, owner_id: str) -> dict:
 
 def _save_job(job: dict) -> None:
     save_job(job)
+
+
+@contextmanager
+def _locked_job(job_id: str, owner_id: str):
+    _job_key(job_id)
+    try:
+        with locked_job(job_id, owner_id) as job:
+            yield job
+    except KeyError as exc:
+        raise HTTPException(404, "Job not found or expired.") from exc
 
 
 def _repair_path(job_id: str, repair_id: str) -> Path:
@@ -586,8 +618,8 @@ def dashboard(request: Request) -> dict:
         "critical": sum(f.get("severity") == "critical" for f in open_findings),
         "fixed": sum(bool(job.get("repair")) and job["repair"].get("state") == "applied_to_copy" for job in finished),
         "security_score": None, "recent_scans": items[:8], "findings_by_severity": {
-            severity: sum(f.get("severity") == severity for f in open_findings)
-            for severity in ("critical", "high", "medium", "low", "informational")
+            severity: sum((f.get("severity") if f.get("severity") in {"critical", "high", "medium", "low", "informational"} else "unassessed") == severity for f in open_findings)
+            for severity in ("critical", "high", "medium", "low", "informational", "unassessed")
         },
     }
 
@@ -614,6 +646,11 @@ async def _create_job(request: Request, uploads: list[UploadFile], provider: str
     user = _current_user(request)
     _auth_rate_limit(request, "scan_upload", 30)
     names = [(upload.filename or "").replace("\\", "/") for upload in uploads]
+    try:
+        for name in names:
+            safe_path(name)
+    except ProjectInputError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
     is_zip = len(uploads) == 1 and Path(names[0]).suffix.lower() == ".zip"
     if any(not path or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts for path in names):
         raise HTTPException(400, "Uploaded file contains an unsafe path.")
@@ -638,33 +675,7 @@ async def _create_job(request: Request, uploads: list[UploadFile], provider: str
                     if total > MAX_UPLOAD:
                         raise HTTPException(413, "ZIP project exceeds the upload size limit.")
                     output.write(chunk)
-            with zipfile.ZipFile(zip_path) as archive:
-                entries = archive.infolist()
-                if not entries or len(entries) > MAX_FILES:
-                    raise HTTPException(400, "ZIP is empty or exceeds the file limit.")
-                expanded = 0
-                source_count = 0
-                for entry in entries:
-                    arcname = entry.filename.replace("\\", "/")
-                    parts = PurePosixPath(arcname).parts
-                    if not arcname or PurePosixPath(arcname).is_absolute() or arcname.startswith("/") or ".." in parts or stat.S_ISLNK(entry.external_attr >> 16):
-                        raise HTTPException(400, "Archive contains an unsafe path or symbolic link.")
-                    expanded += entry.file_size
-                    if expanded > MAX_EXTRACTED:
-                        raise HTTPException(413, "Expanded project exceeds the size limit.")
-                    if not entry.is_dir() and PurePosixPath(arcname).suffix.lower() in SOURCE_EXTENSIONS:
-                        source_count += 1
-                        if entry.file_size > MAX_SOURCE:
-                            raise HTTPException(413, f"Source file {PurePosixPath(arcname).name} exceeds the {MAX_SOURCE // 1000} KB limit.")
-                        if entry.file_size == 0:
-                            raise HTTPException(400, f"Source file {PurePosixPath(arcname).name} is empty.")
-                        try:
-                            with archive.open(entry) as source:
-                                source.read().decode("utf-8")
-                        except UnicodeDecodeError as exc:
-                            raise HTTPException(400, "Source files must use UTF-8 encoding.") from exc
-                if not source_count:
-                    raise HTTPException(400, "ZIP must contain a .c, .cpp, or .h source file.")
+            inspect_archive(zip_path, max_files=MAX_FILES, max_bytes=MAX_EXTRACTED, max_source=MAX_SOURCE)
         else:
             seen: set[str] = set()
             for upload, upload_name in zip(uploads, names):
@@ -694,9 +705,12 @@ async def _create_job(request: Request, uploads: list[UploadFile], provider: str
                 if size == 0:
                     raise HTTPException(400, "Uploaded source file is empty.")
                 try:
-                    target.read_text(encoding="utf-8")
+                    validate_text(target.read_bytes(), Path(upload_name).suffix.lower() in SOURCE_EXTENSIONS)
                 except UnicodeDecodeError as exc:
                     raise HTTPException(400, "Source files must use UTF-8 encoding.") from exc
+    except ProjectInputError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(exc.status_code, str(exc)) from exc
     except zipfile.BadZipFile as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, "Could not read this ZIP archive.") from exc
@@ -832,8 +846,8 @@ def explain_finding(job_id: str, finding_id: str, request: Request) -> dict:
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
     explanation = {**result.model_dump(), "provider_used": provider_used}
-    explanations[finding_id] = explanation
-    _save_job(job)
+    with _locked_job(job_id, job["owner_id"]) as latest:
+        latest.setdefault("explanations", {})[finding_id] = explanation
     return explanation
 
 
@@ -850,13 +864,12 @@ def saved_finding_explanation(job_id: str, finding_id: str, request: Request) ->
 
 @app.post("/api/jobs/{job_id}/findings/{finding_id}/false-positive")
 def mark_false_positive(job_id: str, finding_id: str, request: Request) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
-    finding = next((item for item in job.get("findings", []) if item["id"] == finding_id), None)
-    if not finding:
-        raise HTTPException(404, "Finding not found.")
-    finding["status"] = "false_positive"
-    _save_job(job)
-    return {"id": finding_id, "status": finding["status"]}
+    with _locked_job(job_id, _current_user(request)["id"]) as job:
+        finding = next((item for item in job.get("findings", []) if item["id"] == finding_id), None)
+        if not finding:
+            raise HTTPException(404, "Finding not found.")
+        finding["status"] = "false_positive"
+    return {"id": finding_id, "status": "false_positive"}
 
 
 def _proposal_summary(repair: dict) -> dict:
@@ -993,43 +1006,55 @@ def create_repair(job_id: str, finding_id: str, request: Request, mode: str = "s
 
 @app.post("/api/jobs/{job_id}/repair/{repair_id}/reject")
 def reject_repair(job_id: str, repair_id: str, request: Request) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
-    path = _repair_path(job_id, repair_id)
-    try:
-        repair = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(404, "Repair proposal not found.") from exc
-    current = job.get("repair") or {}
-    if current.get("id") == repair_id:
-        repair.update(current)
-    if repair.get("state") not in ("proposed", "review_ready", "verification_failed"):
-        raise HTTPException(409, "Only a completed repair proposal can be rejected.")
-    repair["state"] = "rejected"
-    path.write_text(json.dumps(repair), encoding="utf-8")
-    for proposal in job.get("proposals", []):
-        if proposal.get("id") == repair_id:
-            proposal["state"] = "rejected"
-    if job.get("repair", {}).get("id") == repair_id:
-        job["repair"]["state"] = "rejected"
-        operation = job.get("repair_operation") or {}
-        operation.update(status="complete", stage="review rejected", finished_at=time.time())
-    _save_job(job)
-    return {"id": repair_id, "state": "rejected"}
+    with _locked_job(job_id, _current_user(request)["id"]) as job:
+        path = _repair_path(job_id, repair_id)
+        try:
+            repair = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(404, "Repair proposal not found.") from exc
+        current = job.get("repair") or {}
+        if current.get("id") == repair_id:
+            repair.update(current)
+        if repair.get("state") not in ("proposed", "review_ready", "verification_failed"):
+            raise HTTPException(409, "Only a completed repair proposal can be rejected.")
+        repair["state"] = "rejected"
+        path.write_text(json.dumps(repair), encoding="utf-8")
+        for proposal in job.get("proposals", []):
+            if proposal.get("id") == repair_id:
+                proposal["state"] = "rejected"
+        if job.get("repair", {}).get("id") == repair_id:
+            job["repair"]["state"] = "rejected"
+            operation = job.get("repair_operation") or {}
+            operation.update(status="complete", stage="review rejected", finished_at=time.time())
+        return {"id": repair_id, "state": "rejected"}
 
 
 @app.post("/api/jobs/{job_id}/apply/{repair_id}")
 def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial: bool = False, confirm_human_review: bool = False) -> dict:
     user_id = _current_user(request)["id"]
-    job = _read_job(job_id, user_id)
+    moved = []
+    try:
+        with _locked_job(job_id, user_id) as job:
+            return _accept_candidate(job_id, repair_id, user_id, job, confirm_partial, confirm_human_review, moved)
+    except Exception:
+        for patched, candidate, record, original in moved:
+            if patched.exists() and not candidate.exists():
+                os.rename(patched, candidate)
+            record.write_text(original, encoding="utf-8")
+        raise
+
+
+def _accept_candidate(job_id, repair_id, user_id, job, confirm_partial, confirm_human_review, moved):
     repair_path = _repair_path(job_id, repair_id)
     try:
-        repair = json.loads(repair_path.read_text(encoding="utf-8"))
+        original_record = repair_path.read_text(encoding="utf-8")
+        repair = json.loads(original_record)
     except (OSError, json.JSONDecodeError):
         raise HTTPException(404, "Repair proposal expired.")
     current = job.get("repair") or {}
     if current.get("id") != repair_id or current.get("state") != "review_ready":
         raise HTTPException(409, "This repair has not finished verification or is no longer available.")
-    outcome = (current.get("checks") or {}).get("verification_outcome", "not_verified")
+    outcome = verification_outcome(current.get("checks") or {})
     if outcome not in ("verified", "partially_verified"):
         raise HTTPException(409, "This repair cannot be accepted because verification failed or is unavailable.")
     if not confirm_human_review:
@@ -1046,8 +1071,11 @@ def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial:
     if not candidate.is_dir() or _tree_hash(candidate) != repair.get("candidate_hash"):
         raise HTTPException(409, "The verified candidate changed or expired. Generate a new repair.")
     patched_root = JOBS_ROOT / job_id / "patched"
+    if patched_root.exists():
+        raise HTTPException(409, "A working copy already exists. Download it or start a new scan.")
     try:
         os.rename(candidate, patched_root)
+        moved.append((patched_root, candidate, repair_path, original_record))
     except FileExistsError as exc:
         raise HTTPException(409, "A working copy already exists. Download it or start a new scan.") from exc
     repair["state"] = "applied_to_copy"
@@ -1061,7 +1089,6 @@ def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial:
     if operation.get("id") == repair.get("operation_id"):
         operation.update(status="complete", stage="review complete", finished_at=time.time())
         operation["events"] = (operation.get("events", []) + [{"at": time.time(), "stage": "review complete", "status": "complete"}])[-100:]
-    _save_job(job)
     return {"state": "applied_to_copy", "download": f"/api/jobs/{job_id}/download", "checks": current["checks"], "review": repair["review"]}
 
 
