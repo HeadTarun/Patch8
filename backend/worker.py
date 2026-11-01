@@ -679,7 +679,7 @@ def process(job_id: str) -> None:
         else:
             safe_extract(original, source)
             original.unlink(missing_ok=True)
-        progress = "Running Clang, Cppcheck, and Semgrep" if ANALYSIS_MODE == "legacy" else f"Running PatchGuard {ANALYSIS_MODE} analysis with Clang, Cppcheck, and Semgrep"
+        progress = "Running Clang, Cppcheck, and Semgrep" if ANALYSIS_MODE == "legacy" else f"Running PatchProof {ANALYSIS_MODE} analysis with Clang, Cppcheck, and Semgrep"
         update(job_id, progress=progress)
         report = run_analysis(source, ANALYSIS_MODE)
         update(job_id, progress="Checking project build and tests")

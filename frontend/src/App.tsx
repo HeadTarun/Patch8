@@ -220,7 +220,7 @@ function App() {
 
     <header className="topbar">
 
-      <a className="brand" href="#top" aria-label="Patch8 home"><span className="brand-mark"><img src="/firmware/patchproof-mark.svg" alt=""/></span><span className="brand-wordmark"><span>Patch</span><span>8</span></span></a>
+      <a className="brand" href="#top" aria-label="PatchProof home"><span className="brand-mark"><img src="/firmware/patchproof-logo.png" alt="PatchProof" style={{height:"32px",width:"auto"}}/></span></a>
 
       <div className="top-links"><span className="top-link"><span className="live-dot"/> CWE 5.0 / Schema 8.0</span><span className="top-divider"/><span className="top-link"><LockKeyhole size={14}/> ephemeral workspace</span></div>
 
@@ -286,7 +286,7 @@ function App() {
 
             if (!analysis) return null;
 
-            return <details className="ir-inspector"><summary>Patch8 analysis details · {analysis.mode} · IR {analysis.ir_version}</summary><div className="ir-summary"><span><b>Status</b>{analysis.status}</span><span><b>Languages</b>{analysis.coverage.languages.join(", ") || "unknown"}</span><span><b>Families</b>{analysis.coverage.supported_families.join(", ")}</span>{analysis.comparison && <span><b>Legacy / IR matches</b>{analysis.comparison.counts.matched} of {analysis.comparison.counts.legacy} / {analysis.comparison.counts.ir}</span>}</div><div className="ir-analyzers">{Object.entries(analysis.coverage.analyzer_status).map(([name, status]) => <span key={name}>{name}: {status.status}{status.error ? ` — ${status.error}` : ""}</span>)}</div>{analysis.coverage.notes.map((note) => <p className="ir-note" key={note}>{note}</p>)}{analysis.errors.map((item, index) => <p className="ir-error" key={`${index}-${item}`}>{item}</p>)}{analysis.comparison && <div className="ir-differences"><b>Disagreements</b><span>Legacy only: {analysis.comparison.counts.legacy_only}; IR only: {analysis.comparison.counts.ir_only}</span>{analysis.comparison.legacy_only.length > 0 && <pre>{JSON.stringify(analysis.comparison.legacy_only, null, 2)}</pre>}{analysis.comparison.ir_only.length > 0 && <pre>{JSON.stringify(analysis.comparison.ir_only, null, 2)}</pre>}</div>}<div className="ir-records"><b>Common intermediate representation ({analysis.records.length})</b><pre>{JSON.stringify(analysis.records, null, 2)}</pre></div></details>;
+            return <details className="ir-inspector"><summary>PatchProof analysis details · {analysis.mode} · IR {analysis.ir_version}</summary><div className="ir-summary"><span><b>Status</b>{analysis.status}</span><span><b>Languages</b>{analysis.coverage.languages.join(", ") || "unknown"}</span><span><b>Families</b>{analysis.coverage.supported_families.join(", ")}</span>{analysis.comparison && <span><b>Legacy / IR matches</b>{analysis.comparison.counts.matched} of {analysis.comparison.counts.legacy} / {analysis.comparison.counts.ir}</span>}</div><div className="ir-analyzers">{Object.entries(analysis.coverage.analyzer_status).map(([name, status]) => <span key={name}>{name}: {status.status}{status.error ? ` — ${status.error}` : ""}</span>)}</div>{analysis.coverage.notes.map((note) => <p className="ir-note" key={note}>{note}</p>)}{analysis.errors.map((item, index) => <p className="ir-error" key={`${index}-${item}`}>{item}</p>)}{analysis.comparison && <div className="ir-differences"><b>Disagreements</b><span>Legacy only: {analysis.comparison.counts.legacy_only}; IR only: {analysis.comparison.counts.ir_only}</span>{analysis.comparison.legacy_only.length > 0 && <pre>{JSON.stringify(analysis.comparison.legacy_only, null, 2)}</pre>}{analysis.comparison.ir_only.length > 0 && <pre>{JSON.stringify(analysis.comparison.ir_only, null, 2)}</pre>}</div>}<div className="ir-records"><b>Common intermediate representation ({analysis.records.length})</b><pre>{JSON.stringify(analysis.records, null, 2)}</pre></div></details>;
 
           })()}
 
@@ -320,7 +320,7 @@ function App() {
 
 
 
-    <footer className="footer"><span><span className="brand-mini"><img src="/firmware/patchproof-mark.svg" alt=""/></span><span className="brand-wordmark"><span>Patch</span><span>8</span></span> <span className="footer-sep">/</span> FIRMWARE REPAIR LAB</span><span>CWE IDs describe weakness types; analysis coverage is limited.</span><span>Built for safer embedded software <span className="footer-heart">✳</span></span></footer>
+    <footer className="footer"><span><span className="brand-mini"><img src="/firmware/patchproof-logo.png" alt="PatchProof" style={{height:"24px",width:"auto"}}/></span> <span className="footer-sep">/</span> FIRMWARE REPAIR LAB</span><span>CWE IDs describe weakness types; analysis coverage is limited.</span><span>Built for safer embedded software <span className="footer-heart">✳</span></span></footer>
 
   </div>;
 

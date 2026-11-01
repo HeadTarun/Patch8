@@ -57,7 +57,7 @@ def _failed_ir_metadata(root: Path, mode: str, report: dict, error: Exception) -
     }
     languages = sorted({detect_language(path.relative_to(root).as_posix()).value for path in source_files(root)})
     return {
-        "product": "PatchGuard",
+        "product": "PatchProof",
         "ir_version": "1.0",
         "mode": mode,
         "status": "FAILED",

@@ -171,7 +171,7 @@ class Coverage(StrictModel):
 
 
 class IRAnalysis(StrictModel):
-    product: Literal["PatchGuard"] = "PatchGuard"
+    product: Literal["PatchProof"] = "PatchProof"
     ir_version: Literal["1.0"] = "1.0"
     mode: Literal["shadow", "unified"]
     status: ScanStatus

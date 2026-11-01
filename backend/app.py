@@ -206,7 +206,7 @@ def _github_request(path: str, token: str, max_bytes: int = 5_000_000) -> bytes:
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "PatchGuard-MVP",
+            "User-Agent": "PatchProof-MVP",
         },
     )
     try:
@@ -234,7 +234,7 @@ def _github_request(path: str, token: str, max_bytes: int = 5_000_000) -> bytes:
 
 def _github_archive(owner: str, repo: str, sha: str) -> bytes:
     url = f"https://codeload.github.com/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}/zip/{sha}"
-    request = urllib.request.Request(url, headers={"Accept": "application/zip", "User-Agent": "PatchGuard-MVP"})
+    request = urllib.request.Request(url, headers={"Accept": "application/zip", "User-Agent": "PatchProof-MVP"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             if urllib.parse.urlsplit(response.geturl()).hostname != "codeload.github.com":
@@ -1095,7 +1095,7 @@ def _accept_candidate(job_id, repair_id, user_id, job, confirm_partial, confirm_
 @app.get("/api/jobs/{job_id}/sarif")
 def download_sarif(job_id: str, request: Request) -> JSONResponse:
     job = _read_job(job_id, _current_user(request)["id"])
-    return JSONResponse(sarif_report(job_id, job.get("findings", [])), headers={"Content-Disposition": f'attachment; filename="patchguard-{job_id}.sarif"'})
+    return JSONResponse(sarif_report(job_id, job.get("findings", [])), headers={"Content-Disposition": f'attachment; filename="patchproof-{job_id}.sarif"'})
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -1122,4 +1122,4 @@ def download_diff(job_id: str, request: Request) -> StreamingResponse:
     if not repair:
         raise HTTPException(404, "No repair has been applied.")
     payload = repair["diff"].encode()
-    return StreamingResponse(io.BytesIO(payload), media_type="text/x-diff", headers={"Content-Disposition": "attachment; filename=patchguard-fix.diff"})
+    return StreamingResponse(io.BytesIO(payload), media_type="text/x-diff", headers={"Content-Disposition": "attachment; filename=patchproof-fix.diff"})
