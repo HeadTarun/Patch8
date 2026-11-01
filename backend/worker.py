@@ -9,10 +9,11 @@ import subprocess
 import statistics
 import tempfile
 import time
+import threading
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from db import claim_job, delete_expired_jobs, get_job, save_job
+from db import claim_job, delete_expired_jobs, get_job, save_job, update_repair_operation, finish_repair
 from analysis_pipeline import run_analysis, validate_analysis_mode
 from scanner import analyze
 
@@ -104,7 +105,10 @@ def sandbox_command(command: list[str], project: Path, build: Path, extra_env: d
     return args
 
 
-def validate_build(job_dir: Path, source: Path) -> dict:
+def validate_build(job_dir: Path, source: Path, on_check=None) -> dict:
+    def report(name, status):
+        if on_check:
+            on_check(name, status)
     build = job_dir / "validation-build"
     if build.exists():
         shutil.rmtree(build)
@@ -128,20 +132,48 @@ def validate_build(job_dir: Path, source: Path) -> dict:
         result["details"] = "Build/test checks unavailable: bubblewrap is not installed."
         return result
     try:
+        probe = sandbox_command(["/bin/true"], source, build)
+        probe_result = subprocess.run(probe or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
+        if probe_result.returncode != 0:
+            logging.warning("Build sandbox unavailable: %s", (probe_result.stderr or probe_result.stdout)[-1000:])
+            result["details"] = "Build verification unavailable: the server could not start its isolated build environment."
+            return result
+        report("build", "running")
         build_result = subprocess.run(wrapped, capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
         result["build"] = "passed" if build_result.returncode == 0 else "failed"
         result["details"] = (build_result.stderr or build_result.stdout)[-3000:]
         if build_result.returncode != 0:
             return result
+        if command[0] == "cmake":
+            wrapped_compile = sandbox_command(["cmake", "--build", "/build", "--parallel", "1"], source, build)
+            compile_result = subprocess.run(wrapped_compile or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
+            result["details"] += "\nBuild:\n" + (compile_result.stderr or compile_result.stdout)[-3000:]
+            if compile_result.returncode != 0:
+                result["build"] = "failed"
+                return result
+        report("build", "passed")
         result["tests"] = "not_available"
         if tests and tests[0] == "ctest" and not list(build.rglob("CTestTestfile.cmake")):
             tests = None
+        if tests and tests[0] == "ctest":
+            listing_command = sandbox_command(["ctest", "--test-dir", "/build", "--show-only=json-v1"], source, build)
+            listing = subprocess.run(listing_command or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
+            try:
+                discovered = json.loads(listing.stdout).get("tests", []) if listing.returncode == 0 else []
+            except (ValueError, AttributeError):
+                discovered = []
+            if not discovered:
+                tests = None
+                result["details"] += "\nNo CTest tests were discovered."
         if tests:
+            report("tests", "running")
             wrapped_tests = sandbox_command(tests, source, build)
             test_result = subprocess.run(wrapped_tests or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
             result["tests"] = "passed" if test_result.returncode == 0 else "failed"
             result["details"] += "\n" + (test_result.stderr or test_result.stdout)[-3000:]
+        report("tests", result["tests"])
         if command[0] == "cmake" and result["tests"] == "passed":
+            report("sanitizers", "running")
             sanitizer_build = job_dir / "sanitizer-build"
             if sanitizer_build.exists():
                 shutil.rmtree(sanitizer_build)
@@ -156,6 +188,9 @@ def validate_build(job_dir: Path, source: Path) -> dict:
             sanitizer_env = {"ASAN_OPTIONS": "detect_leaks=0", "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"}
             wrapped_sanitizers = sandbox_command(sanitizer_command, source, sanitizer_build, sanitizer_env)
             sanitizer_build_result = subprocess.run(wrapped_sanitizers or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
+            if sanitizer_build_result.returncode == 0:
+                sanitizer_compile = sandbox_command(["cmake", "--build", "/build", "--parallel", "1"], source, sanitizer_build, sanitizer_env)
+                sanitizer_build_result = subprocess.run(sanitizer_compile or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
             if sanitizer_build_result.returncode == 0:
                 sanitizer_tests = sandbox_command(["ctest", "--test-dir", "/build", "--output-on-failure"], source, sanitizer_build, sanitizer_env)
                 sanitizer_test_result = subprocess.run(sanitizer_tests or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
@@ -179,14 +214,31 @@ def verify_repair_security(source: Path, job: dict) -> dict:
 
     report = analyze(source)
     original_cwe = (target.get("cwe") or {}).get("id")
-    target_remains = any(
-        item.get("file") == target.get("file")
+    candidates = [item for item in report.get("findings", [])
+        if item.get("file") == target.get("file")
         and item.get("rule_id") == target.get("rule_id")
-        and (item.get("cwe") or {}).get("id") == original_cwe
-        for item in report.get("findings", [])
-    )
-    if target_remains:
-        return {"status": "failed", "details": "The target finding remains after the repair."}
+        and (item.get("cwe") or {}).get("id") == original_cwe]
+    original_peers = [item for item in job.get("findings", [])
+        if item.get("file") == target.get("file") and item.get("rule_id") == target.get("rule_id")
+        and (item.get("cwe") or {}).get("id") == original_cwe]
+    if candidates:
+        if len(original_peers) <= 1:
+            return {"status": "failed", "details": "A matching target finding remains after the repair."}
+        target_line = target.get("line")
+        if not isinstance(target_line, int) or any(not isinstance(item.get("line"), int) for item in candidates + original_peers):
+            return {"status": "unverified", "details": "Multiple matching findings cannot be distinguished by location."}
+        def adjusted(line):
+            for edit in sorted(repair.get("edits", []), key=lambda e: e.get("line", 0)):
+                if edit.get("line", 0) < line:
+                    line += edit["replacement"].count("\n") - edit["original"].count("\n")
+            return line
+        target_adjusted = adjusted(target_line)
+        for item in candidates:
+            distances = sorted((abs(item["line"] - adjusted(peer["line"])), peer.get("id")) for peer in original_peers)
+            if len(distances) > 1 and distances[0][0] == distances[1][0]:
+                return {"status": "unverified", "details": "Matching findings have ambiguous locations after the repair."}
+            if distances[0][1] == target.get("id") or item["line"] == target_adjusted:
+                return {"status": "failed", "details": "The target finding remains after the repair."}
 
     def key(item: dict) -> tuple:
         return item.get("file"), item.get("rule_id"), (item.get("cwe") or {}).get("id"), item.get("message")
@@ -291,16 +343,44 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
     job = job or get_job(job_id) or {}
     if not job or not job.get("repair"):
         return
+    operation_id = (job.get("repair_operation") or {}).get("id", "")
+    candidate_id = job["repair"]["id"]
+    stop = threading.Event()
+    def heartbeat():
+        while not stop.wait(20):
+            try:
+                if not update_repair_operation(job_id, operation_id, {"lease_until": time.time() + 120}):
+                    return
+            except Exception:
+                logging.exception("Verification heartbeat failed")
+    heart = threading.Thread(target=heartbeat, daemon=True)
+    heart.start()
+    check_states = {key: "pending" for key in ("build", "tests", "sanitizers", "security")}
+    def report(name, status):
+        check_states[name] = status
+        stage = {"build": "building", "tests": "testing", "sanitizers": "sanitizer checks", "security": "security rescan"}[name]
+        if not update_repair_operation(job_id, operation_id, {"stage": stage, "check_states": dict(check_states), "lease_until": time.time() + 120}):
+            raise RuntimeError("Verification operation expired or was replaced.")
+    workspace = None
     try:
         job_dir = JOBS_ROOT / job_id
-        validation_source = job_dir / "patched-validation-source"
+        workspace = Path(tempfile.mkdtemp(prefix="verification-", dir=job_dir))
+        validation_source = workspace / "source"
+        candidate = job_dir / "candidates" / candidate_id
+        shutil.copytree(candidate, validation_source)
+        if not update_repair_operation(job_id, operation_id, {"status": "verifying", "stage": "preparing verification", "lease_until": time.time() + 120}):
+            return
+        checks = validate_build(workspace, validation_source, on_check=report)
+        for key in ("build", "tests", "sanitizers"):
+            report(key, checks[key])
         shutil.rmtree(validation_source, ignore_errors=True)
-        shutil.copytree(job_dir / "patched", validation_source)
-        checks = validate_build(job_dir, validation_source)
+        shutil.copytree(candidate, validation_source)
+        report("security", "running")
         security = verify_repair_security(validation_source, job)
         checks["security"] = security["status"]
         checks["security_details"] = security["details"]
-        patched_benchmark = run_benchmark(validation_source, job_dir / "validation-build") if checks["build"] == "passed" else None
+        report("security", security["status"])
+        patched_benchmark = run_benchmark(validation_source, workspace / "validation-build") if checks["build"] == "passed" else None
         shutil.rmtree(validation_source, ignore_errors=True)
         baseline = job.get("performance_baseline")
         performance = None
@@ -316,21 +396,22 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
             else "passed" if all(checks.get(name) == "passed" for name in required_checks)
             else "unverified"
         )
-        job["checks"] = checks
-        job["performance"] = performance
-        job["repair"]["checks"] = checks
-        job["repair"]["state"] = "applied_to_copy"
-        job["state"] = "complete"
-        job["progress"] = f"Patch verification {checks['verification']}"
-        save_job(job)
+        available = [checks.get(name) for name in required_checks]
+        checks["verification_outcome"] = (
+            "failed" if "failed" in available else
+            "verified" if all(value == "passed" for value in available) else
+            "partially_verified" if "passed" in available else "not_verified"
+        )
+        finish_repair(job_id, operation_id, candidate_id, checks, performance)
     except Exception as exc:
-        job["state"] = "complete"
-        job["progress"] = "Patch applied; validation failed to run"
-        job["checks"] = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "security": "unverified", "security_details": str(exc)[:1000], "verification": "unverified", "performance": "not_measured", "details": str(exc)[:1000]}
-        job["performance"] = None
-        job["repair"]["checks"] = job["checks"]
-        job["repair"]["state"] = "applied_to_copy"
-        save_job(job)
+        logging.exception("Candidate verification interrupted: %s", candidate_id)
+        checks = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "security": "unverified", "verification": "unverified", "verification_outcome": "not_verified", "performance": "not_measured", "details": "Verification could not finish. Retry the repair."}
+        finish_repair(job_id, operation_id, candidate_id, checks, error="Verification could not finish. Your original code is unchanged.")
+    finally:
+        stop.set()
+        heart.join(timeout=6)
+        if workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> None:
@@ -354,7 +435,7 @@ def main() -> None:
         if item:
             job_id, job = item
             try:
-                if job.get("state") == "validating":
+                if job.get("state") == "verifying":
                     validate_repair(job_id, job)
                 else:
                     process(job_id)

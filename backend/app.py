@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel, Field
 
 from auth import issue_session, read_session, supabase_auth, supabase_user
-from db import get_job, list_user_jobs, save_job
+from db import get_job, list_user_jobs, save_job, begin_repair, update_repair_operation, enqueue_repair, recover_repairs
 from providers import explain_with_provider, generate_with_provider
 from scanner import sarif_report
 from taxonomy import catalog, get_weakness, supported_weaknesses
@@ -211,8 +212,19 @@ def _repair_path(job_id: str, repair_id: str) -> Path:
 
 
 def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Path, target: Path) -> dict:
-    if len(before) > MAX_REPAIR_CONTEXT_CHARS:
-        raise HTTPException(413, "This source file exceeds the configured repair context limit.")
+    lines = before.splitlines(keepends=True)
+    line = int(finding["line"])
+    if line < 1 or line > len(lines):
+        raise HTTPException(422, "Finding location is outside the source file.")
+    start, end = max(0, line - 41), min(len(lines), line + 40)
+    while sum(map(len, lines[start:end])) > MAX_REPAIR_CONTEXT_CHARS and end - start > 1:
+        if line - start > end - line:
+            start += 1
+        else:
+            end -= 1
+    localized = "".join(lines[start:end])
+    if len(localized) > MAX_REPAIR_CONTEXT_CHARS:
+        raise HTTPException(413, "Finding line exceeds the configured repair context limit.")
     headers = []
     header_chars = 0
     seen_headers = set()
@@ -242,9 +254,75 @@ def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Pa
         "mapping_confidence": finding["mapping_confidence"],
         "file": finding["file"],
         "line": finding["line"],
-        "source": before,
+        "source": localized,
+        "numbered_source": "".join(f"{n}: {text}" for n, text in enumerate(lines[start:end], start + 1)),
+        "retry_feedback": "None",
+        "scope_start": sum(map(len, lines[:start])),
+        "scope_end": sum(map(len, lines[:end])),
+        "scope_start_line": start + 1,
+        "scope_end_line": end,
         "headers": "\n\n".join(headers) or "No bounded project headers were included.",
+        "includes": "".join(line for line in lines if re.match(r"^\s*#\s*include\s*[<\"]", line))[:2000] or "No include lines.",
     }
+
+
+def _validate_edits(before: str, edits: list[dict], scope_start: int, scope_end: int) -> tuple[str, list[dict], int, int]:
+    spans = []
+    lines = before.splitlines(keepends=True)
+    endings = {"crlf" if line.endswith("\r\n") else "lf" for line in lines if line.endswith("\n")}
+    if len(endings) > 1 or "\r" in before.replace("\r\n", ""):
+        raise ValueError("mixed_line_endings: Source uses unsupported mixed line endings.")
+    newline = "\r\n" if "crlf" in endings else "\n"
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for index, edit in enumerate(edits):
+        original, replacement = edit["original"], edit["replacement"]
+        first, last = edit.get("start_line"), edit.get("end_line")
+        if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first or last > len(lines):
+            raise ValueError(f"wrong_range: Edit {index + 1} has an invalid line range.")
+        range_start, range_end = offsets[first - 1], offsets[last]
+        region = before[range_start:range_end]
+        normalized = region.replace("\r\n", "\n")
+        expected = original.replace("\r\n", "\n")
+        if not expected:
+            raise ValueError(f"missing_context: Edit {index + 1} has no expected source text.")
+        position = normalized.find(expected)
+        if position < 0:
+            raise ValueError(f"text_mismatch: Edit {index + 1} does not match lines {first}-{last}.")
+        if normalized.find(expected, position + 1) >= 0:
+            raise ValueError(f"ambiguous_context: Edit {index + 1} matches more than once in its declared range.")
+        start = range_start + len(normalized[:position].replace("\n", newline))
+        end = start + len(expected.replace("\n", newline))
+        original = before[start:end]
+        replacement = replacement.replace("\r\n", "\n").replace("\n", newline)
+        kind = edit.get("kind", "code")
+        if kind == "include":
+            if not re.fullmatch(r'[ \t]*#[ \t]*include[^\r\n]*(?:\r?\n)', original):
+                raise ValueError("include_context: Include edit must anchor to one existing include line.")
+            extra = replacement.removeprefix(original)
+            if not replacement.startswith(original) or not re.fullmatch(r'[ \t]*#[ \t]*include[ \t]*<[^>\r\n]+>[ \t]*(?:\r?\n)', extra):
+                raise ValueError("include_context: Include edit must only add one standard include.")
+        elif kind != "code" or start < scope_start or end > scope_end:
+            raise ValueError(f"scope_violation: Edit {index + 1} exceeds the localized repair scope.")
+        if original == replacement:
+            raise ValueError("no_change: Edit makes no change.")
+        spans.append((start, end, {**edit, "original": original, "replacement": replacement}))
+    spans.sort(key=lambda item: item[0])
+    if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
+        raise ValueError("overlap: Repair edits overlap.")
+    after = before
+    for start, end, edit in reversed(spans):
+        after = after[:start] + edit["replacement"] + after[end:]
+    matcher = difflib.SequenceMatcher(a=before.splitlines(), b=after.splitlines(), autojunk=False)
+    added = deleted = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            deleted += i2 - i1
+            added += j2 - j1
+    if max(added, deleted) > MAX_REPAIR_CHANGED_LINES:
+        raise ValueError("size_limit: Repair exceeds the configured changed-line limit.")
+    return after, [{**edit, "start": start, "end": end, "line": before.count("\n", 0, start) + 1} for start, end, edit in spans], added, deleted
 
 
 def _changed_line_count(before: str, after: str) -> int:
@@ -280,7 +358,7 @@ def providers_status() -> dict:
         "providers": {
             "auto": {"configured": ollama_configured or groq_configured, "label": "Automatic (Ollama → Groq)"},
             "ollama": {"configured": ollama_configured, "available": ollama_available, "model_available": ollama_model_available, "model": ollama_model},
-            "groq": {"configured": groq_configured, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")},
+            "groq": {"configured": groq_configured, "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")},
             "none": {"configured": True, "label": "Scan only"},
         }
     }
@@ -317,7 +395,7 @@ def weaknesses() -> dict:
 
 
 @app.post("/api/jobs", status_code=202)
-async def create_job(request: Request, files: list[UploadFile] = File(default=[]), file: UploadFile | None = File(default=None), provider: str = Form("none")) -> dict:
+async def create_job(request: Request, files: list[UploadFile] = File(default=[]), file: UploadFile | None = File(default=None), provider: str = Form("auto")) -> dict:
     uploads = files or ([file] if file else [])
     if not uploads:
         raise HTTPException(400, "Choose source files or a ZIP project.")
@@ -475,7 +553,7 @@ def explain_finding(job_id: str, finding_id: str, request: Request) -> dict:
     if job.get("state") != "complete":
         raise HTTPException(409, "Wait for the scan to finish before requesting an explanation.")
     if job.get("provider") == "none":
-        raise HTTPException(409, "This scan was created without an AI provider.")
+        raise HTTPException(409, "This scan was created without AI. Start a new scan to request an explanation.")
     finding = next((item for item in job.get("findings", []) if item.get("id") == finding_id), None)
     if not finding:
         raise HTTPException(404, "Finding not found.")
@@ -539,17 +617,92 @@ def mark_false_positive(job_id: str, finding_id: str, request: Request) -> dict:
 
 
 def _proposal_summary(repair: dict) -> dict:
-    return {key: repair[key] for key in ("id", "finding_id", "file", "diff", "explanation", "provider_used", "state")}
+    return {key: repair[key] for key in ("id", "finding_id", "file", "diff", "explanation", "provider_used", "state", "metadata") if key in repair}
 
 
 @app.get("/api/jobs/{job_id}/repair/{finding_id}")
 def get_repair(job_id: str, finding_id: str, request: Request) -> dict:
     job = _read_job(job_id, _current_user(request)["id"])
-    proposal = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") == "proposed"), None)
+    proposal = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") in ("proposed", "validating", "review_ready", "verification_failed")), None)
     if not proposal:
         raise HTTPException(404, "No proposed repair is saved for this finding.")
     return proposal
 
+
+@app.get("/api/jobs/{job_id}/findings/{finding_id}/source")
+def finding_source(job_id: str, finding_id: str, request: Request) -> dict:
+    job = _read_job(job_id, _current_user(request)["id"])
+    finding = next((f for f in job.get("findings", []) if f["id"] == finding_id), None)
+    if not finding:
+        raise HTTPException(404, "Finding not found.")
+    root = (JOBS_ROOT / job_id / "source").resolve()
+    target = (root / finding["file"]).resolve()
+    if not target.is_relative_to(root) or not target.is_file() or target.stat().st_size > 200_000:
+        raise HTTPException(404, "Source preview is unavailable or has expired.")
+    data = target.read_bytes()
+    return {"file": finding["file"], "line": finding["line"], "original": data.decode("utf-8", errors="replace"), "source_hash": hashlib.sha256(data).hexdigest(), "expires_at": job.get("expires_at")}
+
+
+@app.get("/api/jobs/{job_id}/repair-status")
+def repair_status(job_id: str, request: Request, finding_id: str | None = None) -> dict:
+    job = _read_job(job_id, _current_user(request)["id"])
+    recover_repairs(job_id)
+    job = _read_job(job_id, _current_user(request)["id"])
+    operation = job.get("repair_operation") or {}
+    active = operation.get("status") in ("running", "queued", "verifying")
+    repair = job.get("repair") or {}
+    if finding_id and operation.get("finding_id") != finding_id:
+        operation = {}
+    if (finding_id and repair.get("finding_id") != finding_id) or (operation and repair.get("operation_id") != operation.get("id")):
+        repair = {}
+    preview = None
+    if repair.get("id") and repair.get("file"):
+        source_root = JOBS_ROOT / job_id / "source"
+        original = (source_root / repair["file"]).resolve()
+        if original.is_relative_to(source_root.resolve()) and original.is_file():
+            preview = {"original": original.read_text(encoding="utf-8", errors="replace"), "proposed": repair.get("code", ""), "line": (repair.get("metadata") or {}).get("line")}
+    return {"operation": operation, "job_busy": active, "repair": _proposal_summary(repair) if repair else None, "checks": repair.get("checks") if repair else None, "preview": preview}
+
+
+def _rejected_attempt(exc: Exception, result, before: str, attempt: int) -> dict:
+    technical = str(exc)[:500]
+    code = technical.split(":", 1)[0]
+    if code not in {"missing_context", "text_mismatch", "wrong_range", "ambiguous_context", "overlap", "scope_violation", "include_context", "no_change", "size_limit", "mixed_line_endings", "invalid_path"}:
+        code = "provider_unavailable" if isinstance(exc, RuntimeError) else "invalid_schema"
+    match = re.search(r"Edit (\d+)", technical)
+    edit_index = int(match.group(1)) if match else None
+    snippets = []
+    budget = 12000
+    for index, edit in enumerate(result.edits if result else []):
+        if index >= 8 or budget <= 0:
+            break
+        first, last = edit.start_line, edit.end_line
+        actual = "".join(before.splitlines(keepends=True)[first - 1:last]) if 1 <= first <= last <= len(before.splitlines()) else ""
+        limit = min(2000, budget // 3)
+        snippets.append({"edit_index": index + 1, "start_line": first, "end_line": last, "actual": actual[:limit], "expected": edit.original[:limit], "replacement": edit.replacement[:limit], "reason": edit.reason[:500], "truncated": any(len(s) > limit for s in (actual, edit.original, edit.replacement))})
+        budget -= sum(len(snippets[-1][key]) for key in ("actual", "expected", "replacement"))
+    failed = next((s for s in snippets if s["edit_index"] == edit_index), None)
+    location = f" at line {failed['start_line']}" if failed else ""
+    message = (f"The AI suggested replacing code that does not match your uploaded file{location}." if code in ("text_mismatch", "missing_context", "ambiguous_context", "wrong_range") else "The suggestion did not pass the repair safety checks.")
+    if code == "provider_unavailable":
+        message = "The AI provider could not generate a suggestion. Check provider availability or try again later."
+    if attempt == 2:
+        message += " A second attempt also failed."
+    message += " Your original code is unchanged. Build and security verification have not started."
+    return {"attempt": attempt, "at": time.time(), "code": code, "stage": "generating" if code == "provider_unavailable" else "checking edits", "edit_index": edit_index, "start_line": failed["start_line"] if failed else None, "end_line": failed["end_line"] if failed else None, "message": message, "technical": technical, "retryable": True, "edits": snippets}
+
+
+def _tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("Candidate contains a symbolic link.")
+        if path.is_file():
+            name = path.relative_to(root).as_posix().encode("utf-8")
+            digest.update(len(name).to_bytes(8, "big")); digest.update(name)
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "big")); digest.update(content)
+    return digest.hexdigest()
 
 @app.post("/api/jobs/{job_id}/repair/{finding_id}")
 def create_repair(job_id: str, finding_id: str, request: Request) -> dict:
@@ -557,11 +710,15 @@ def create_repair(job_id: str, finding_id: str, request: Request) -> dict:
     if job["state"] != "complete":
         raise HTTPException(409, "Wait for the scan to finish before generating a repair.")
     if job["provider"] == "none":
-        raise HTTPException(409, "Select a repair provider before requesting a patch.")
+        raise HTTPException(409, "This scan was created without AI. Start a new scan to request a repair.")
     finding = next((item for item in job.get("findings", []) if item["id"] == finding_id), None)
     if not finding:
         raise HTTPException(404, "Finding not found.")
-    existing = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") == "proposed"), None)
+    if finding.get("status") == "false_positive":
+        raise HTTPException(409, "False-positive findings do not support automated repair.")
+    if (JOBS_ROOT / job_id / "patched").exists():
+        raise HTTPException(409, "A working copy already exists. Download it or start a new scan.")
+    existing = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") in ("validating", "review_ready")), None)
     if existing:
         return existing
     if not finding.get("cwe"):
@@ -572,34 +729,65 @@ def create_repair(job_id: str, finding_id: str, request: Request) -> dict:
         raise HTTPException(400, "Finding source is no longer available.")
     if target.stat().st_size > 200_000:
         raise HTTPException(413, "This file is too large for one repair request.")
-    before = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        before = target.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(422, "Repair requires UTF-8 source; the original file was preserved.") from exc
     cwe = get_weakness(finding["cwe"]["id"])
     if not cwe:
         raise HTTPException(400, "CWE mapping could not be loaded.")
-    try:
-        result, provider_used = generate_with_provider(job["provider"], _build_repair_context(before, finding, cwe, source_root, target))
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    if result.file != finding["file"]:
-        raise HTTPException(502, "The repair response did not match the requested file.")
-    after = result.code
-    if after == before:
-        raise HTTPException(422, "The model returned no usable source change.")
-    max_output_chars = min(MAX_REPAIR_CONTEXT_CHARS + 4_000, max(len(before) * 2, len(before) + 2_048))
-    if len(after) > max_output_chars:
-        raise HTTPException(422, "The proposed replacement is too large relative to the source file.")
-    changed_lines = _changed_line_count(before, after)
-    allowed_changes = min(MAX_REPAIR_CHANGED_LINES, max(10, len(before.splitlines()) // 3))
-    if changed_lines > allowed_changes:
-        raise HTTPException(422, "The proposed repair changes too much source to apply safely.")
+    context = _build_repair_context(before, finding, cwe, source_root, target)
+    operation_id = str(uuid.uuid4())
+    operation = {"id": operation_id, "finding_id": finding_id, "stage": "locating code", "status": "running", "started_at": time.time(), "deadline": time.time() + 400, "attempt": 0, "events": [{"at": time.time(), "stage": "locating code", "status": "running"}], "scope_start_line": context["scope_start_line"], "scope_end_line": context["scope_end_line"]}
+    if not begin_repair(job_id, _current_user(request)["id"], operation):
+        raise HTTPException(409, "Another repair is already in progress. View its status.")
+    chosen_provider = job["provider"]
+    attempts = []
+    for attempt in range(2):
+        result = None
+        try:
+            update_repair_operation(job_id, operation_id, {"stage": "generating" if attempt == 0 else "retrying", "attempt": attempt + 1})
+            result, provider_used = generate_with_provider(chosen_provider, context, on_event=lambda event: update_repair_operation(job_id, operation_id, event))
+            chosen_provider = provider_used
+            update_repair_operation(job_id, operation_id, {"stage": "checking edits", "provider": provider_used})
+            if result.file != finding["file"]:
+                raise ValueError("invalid_path: Repair targets a different file.")
+            after, edits, added, deleted = _validate_edits(before, [edit.model_dump() for edit in result.edits], context["scope_start"], context["scope_end"])
+            break
+        except (ValueError, RuntimeError) as exc:
+            detail = _rejected_attempt(exc, result, before, attempt + 1)
+            attempts.append(detail)
+            update_repair_operation(job_id, operation_id, {"attempts": attempts, "error_detail": detail})
+            if attempt == 1:
+                update_repair_operation(job_id, operation_id, {"stage": detail["stage"], "status": "failed", "error": detail["message"]})
+                raise HTTPException(422, detail) from exc
+            context["retry_feedback"] = f"{detail['technical']} Allowed source lines: {context['scope_start_line']}-{context['scope_end_line']}. Use absolute line numbers and exact original text, including indentation. Actual source at failed ranges: {json.dumps(detail['edits'])[:12000]}"
     diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=f"a/{finding['file']}", tofile=f"b/{finding['file']}"))
     repair_id = str(uuid.uuid4())
-    repair = {"id": repair_id, "finding_id": finding_id, "file": finding["file"], "code": after, "diff": diff, "explanation": result.explanation, "provider_used": provider_used, "state": "proposed", "created_at": time.time()}
-    repair_dir = JOBS_ROOT / job_id / "repairs"
-    repair_dir.mkdir(parents=True, exist_ok=True)
-    _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
-    job.setdefault("proposals", []).append(_proposal_summary(repair))
-    _save_job(job)
+    metadata = {"line": finding["line"], "scope_start_line": context["scope_start_line"], "scope_end_line": context["scope_end_line"], "localization": "bounded line window", "added_lines": added, "deleted_lines": deleted, "reasons": [edit["reason"] for edit in edits], "security_improvement": result.security_improvement, "warnings": ["Function boundaries were not established; scope is based on nearby lines."]}
+    repair = {"id": repair_id, "finding_id": finding_id, "file": finding["file"], "code": after, "diff": diff, "explanation": result.explanation, "provider_used": provider_used, "state": "proposed", "created_at": time.time(), "source_hash": hashlib.sha256(before.encode("utf-8")).hexdigest(), "scope_start": context["scope_start"], "scope_end": context["scope_end"], "edits": edits, "metadata": metadata}
+    repair["operation_id"] = operation_id
+    update_repair_operation(job_id, operation_id, {"stage": "preparing candidate", "error_detail": None})
+    candidate_root = JOBS_ROOT / job_id / "candidates" / repair_id
+    try:
+        candidate_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_root, candidate_root)
+        candidate_target = (candidate_root / repair["file"]).resolve()
+        if not candidate_target.is_relative_to(candidate_root.resolve()):
+            raise ValueError("Invalid candidate path.")
+        candidate_target.write_bytes(after.encode("utf-8"))
+        repair["candidate_hash"] = _tree_hash(candidate_root)
+        repair["state"] = "validating"
+        repair["checks"] = {"build": "pending", "tests": "pending", "sanitizers": "pending", "security": "pending", "verification": "pending", "performance": "not_measured"}
+        repair_dir = JOBS_ROOT / job_id / "repairs"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
+        if not enqueue_repair(job_id, operation_id, repair, _proposal_summary(repair)):
+            raise ValueError("Repair operation expired or was replaced.")
+    except Exception as exc:
+        shutil.rmtree(candidate_root, ignore_errors=True)
+        update_repair_operation(job_id, operation_id, {"stage": "failed", "status": "failed", "error": "Could not prepare repair candidate."})
+        raise HTTPException(409, "Could not prepare repair candidate; retry the repair.") from exc
     return _proposal_summary(repair)
 
 
@@ -624,36 +812,47 @@ def reject_repair(job_id: str, repair_id: str, request: Request) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/apply/{repair_id}")
-def apply_repair(job_id: str, repair_id: str, request: Request) -> dict:
+def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial: bool = False) -> dict:
     job = _read_job(job_id, _current_user(request)["id"])
     repair_path = _repair_path(job_id, repair_id)
     try:
         repair = json.loads(repair_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raise HTTPException(404, "Repair proposal expired.")
-    if repair.get("state") != "proposed":
-        raise HTTPException(409, "Only a proposed repair can be applied.")
+    current = job.get("repair") or {}
+    if current.get("id") != repair_id or current.get("state") != "review_ready":
+        raise HTTPException(409, "This repair has not finished verification or is no longer available.")
+    outcome = (current.get("checks") or {}).get("verification_outcome", "not_verified")
+    if outcome not in ("verified", "partially_verified"):
+        raise HTTPException(409, "This repair cannot be accepted because verification failed or is unavailable.")
+    if outcome == "partially_verified" and not confirm_partial:
+        raise HTTPException(409, "Confirm acceptance with unavailable checks before continuing.")
     source_root = JOBS_ROOT / job_id / "source"
+    target = (source_root / repair.get("file", "")).resolve()
+    if not target.is_relative_to(source_root.resolve()) or not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != repair.get("source_hash"):
+        raise HTTPException(409, "Source changed since proposal generation. Generate a new repair.")
+    candidate = JOBS_ROOT / job_id / "candidates" / repair_id
+    if not candidate.is_dir() or _tree_hash(candidate) != repair.get("candidate_hash"):
+        raise HTTPException(409, "The verified candidate changed or expired. Generate a new repair.")
     patched_root = JOBS_ROOT / job_id / "patched"
-    if patched_root.exists():
-        shutil.rmtree(patched_root)
-    shutil.copytree(source_root, patched_root)
-    target = (patched_root / repair["file"]).resolve()
-    if not target.is_relative_to(patched_root.resolve()):
-        raise HTTPException(400, "Invalid patch path.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(repair["code"], encoding="utf-8")
-    repair["state"] = "validating"
-    repair["checks"] = {"build": "running", "tests": "not_available", "sanitizers": "not_available", "security": "running", "verification": "running", "performance": "not_measured"}
-    job["state"] = "validating"
-    job["progress"] = "Checking the patched copy in an offline sandbox"
-    job["repair"] = {key: repair[key] for key in ("id", "finding_id", "file", "diff", "explanation", "state", "checks")}
+    try:
+        patched_root.mkdir()
+    except FileExistsError as exc:
+        raise HTTPException(409, "A working copy already exists. Download it or start a new scan.") from exc
+    try:
+        os.rename(candidate, patched_root)
+    except Exception:
+        patched_root.rmdir()
+        raise
+    repair["state"] = "applied_to_copy"
+    _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
+    job["repair"]["state"] = "applied_to_copy"
+    job["progress"] = "Verified candidate accepted to working copy"
     for proposal in job.get("proposals", []):
         if proposal.get("id") == repair_id:
-            proposal["state"] = "validating"
-    job["checks"] = repair["checks"]
+            proposal["state"] = "applied_to_copy"
     _save_job(job)
-    return {"state": repair["state"], "download": f"/api/jobs/{job_id}/download", "checks": repair["checks"]}
+    return {"state": "applied_to_copy", "download": f"/api/jobs/{job_id}/download", "checks": current["checks"]}
 
 
 @app.get("/api/jobs/{job_id}/sarif")

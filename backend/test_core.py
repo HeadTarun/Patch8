@@ -98,7 +98,7 @@ class AuthTests(unittest.TestCase):
 
 class ProviderTests(unittest.TestCase):
     def test_auto_falls_back_to_groq_and_reports_provider(self):
-        proposal = providers.PatchProposal(file="main.c", code="int main(void) { return 0; }", explanation="fixed")
+        proposal = providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=1, end_line=1, original="bad", replacement="good", reason="fix")], explanation="fixed", security_improvement="safe")
         with patch.object(providers, "_ollama", side_effect=RuntimeError("offline")), patch.object(providers, "_groq", return_value=proposal):
             result, actual = providers.generate_with_provider("auto", {"file": "main.c"})
         self.assertIs(result, proposal)
@@ -123,6 +123,136 @@ class ProviderTests(unittest.TestCase):
                 providers.explain_with_provider("ollama", {})
         groq.assert_not_called()
 
+
+
+class TargetedRepairTests(unittest.TestCase):
+    def test_mismatch_attempt_keeps_actual_expected_and_suggestion(self):
+        proposal = providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=2, end_line=2, original="wrong", replacement="fixed", reason="reason")], explanation="fix", security_improvement="safe")
+        result = app._rejected_attempt(ValueError("text_mismatch: Edit 1 does not match lines 2-2."), proposal, "first\nactual\n", 2)
+        self.assertEqual(result["code"], "text_mismatch")
+        self.assertEqual(result["edits"][0]["actual"], "actual\n")
+        self.assertEqual(result["edits"][0]["expected"], "wrong")
+        self.assertEqual(result["edits"][0]["replacement"], "fixed")
+        self.assertIn("verification have not started", result["message"])
+
+    def test_source_preview_is_owner_scoped_and_available_without_repair(self):
+        job_id = "00000000-0000-0000-0000-000000000004"
+        job = {"id": job_id, "owner_id": "owner-a", "findings": [{"id": "f", "file": "main.c", "line": 1}]}
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / job_id / "source"
+            source.mkdir(parents=True)
+            (source / "main.c").write_text("int x;\n")
+            with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temp)), patch.object(app, "get_job", return_value=job):
+                client = TestClient(app.app)
+                client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
+                self.assertEqual(client.get(f"/api/jobs/{job_id}/findings/f/source").json()["original"], "int x;\n")
+                client.cookies.set("patchguard_session", auth.issue_session("owner-b", "b@example.com"))
+                self.assertEqual(client.get(f"/api/jobs/{job_id}/findings/f/source").status_code, 404)
+
+    def test_local_edit_preserves_crlf_and_unrelated_source(self):
+        before = "int helper(void) { return 1; }\r\nint f(int *p) { return *p; }\r\n"
+        edit = {"start_line":2, "end_line":2, "original": "return *p;", "replacement": "return p ? *p : 0;", "reason": "check pointer", "kind": "code"}
+        after, edits, added, deleted = app._validate_edits(before, [edit], 0, len(before))
+        self.assertEqual(after, before.replace(edit["original"], edit["replacement"]))
+        self.assertEqual((added, deleted), (1, 1))
+        self.assertEqual(edits[0]["line"], 2)
+
+    def test_ambiguous_overlapping_and_out_of_scope_edits_fail(self):
+        before = "int x;\nint x;\nint value = 1;\n"
+        for edits, start, end in [
+            ([{"start_line":1, "end_line":2, "original":"int x;", "replacement":"int y;", "reason":"x"}], 0, len(before)),
+            ([{"start_line":3, "end_line":3, "original":"int value", "replacement":"long value", "reason":"x"}, {"start_line":3, "end_line":3, "original":"value = 1", "replacement":"value = 2", "reason":"y"}], 0, len(before)),
+            ([{"start_line":3, "end_line":3, "original":"int value", "replacement":"long value", "reason":"x"}], 0, 2),
+        ]:
+            with self.assertRaises(ValueError):
+                app._validate_edits(before, edits, start, end)
+
+    def test_repeated_text_outside_selected_range_and_newlines(self):
+        before = "int a(){return 0;}\r\nint b(){return 0;}\r\n"
+        edit = {"start_line":2, "end_line":2, "original":"int b(){return 0;}\n", "replacement":"int b(){return 1;}\n", "reason":"fix", "kind":"code"}
+        after, _, _, _ = app._validate_edits(before, [edit], 0, len(before))
+        self.assertEqual(after, "int a(){return 0;}\r\nint b(){return 1;}\r\n")
+        edit["start_line"] = 1
+        edit["end_line"] = 1
+        with self.assertRaisesRegex(ValueError, "text_mismatch"):
+            app._validate_edits(before, [edit], 0, len(before))
+
+    def test_mixed_line_endings_and_indent_mismatch_rejected(self):
+        source = "int a;\r\n int b;\n"
+        edit = {"start_line":2, "end_line":2, "original":"int b;", "replacement":"int c;", "reason":"fix"}
+        with self.assertRaisesRegex(ValueError, "mixed_line_endings"):
+            app._validate_edits(source, [edit], 0, len(source))
+        source = "int a;\n int b;\n"
+        edit["original"] = "  int b;"
+        with self.assertRaisesRegex(ValueError, "text_mismatch"):
+            app._validate_edits(source, [edit], 0, len(source))
+
+    def test_verification_uses_fresh_copy_after_build_mutates_files(self):
+        job_id = "00000000-0000-0000-0000-000000000004"
+        repair_id = "00000000-0000-0000-0000-000000000005"
+        job = {"id": job_id, "repair": {"id": repair_id, "finding_id": "f"}, "repair_operation": {"id": "op"}, "findings": []}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate = root / job_id / "candidates" / repair_id
+            candidate.mkdir(parents=True)
+            (candidate / "main.c").write_text("original\n")
+            def build(directory, source, on_check=None):
+                (source / "main.c").write_text("modified by build\n")
+                return {"build":"passed", "tests":"not_available", "sanitizers":"not_available", "performance":"not_measured"}
+            def security(source, current):
+                self.assertEqual((source / "main.c").read_text(), "original\n")
+                return {"status":"passed", "details":"checked"}
+            with patch.object(worker, "JOBS_ROOT", root), patch.object(worker, "validate_build", side_effect=build), patch.object(worker, "verify_repair_security", side_effect=security), patch.object(worker, "run_benchmark", return_value=None), patch.object(worker, "update_repair_operation", return_value=True), patch.object(worker, "get_job", return_value=job), patch.object(worker, "finish_repair") as finish:
+                worker.validate_repair(job_id, job)
+            self.assertEqual((candidate / "main.c").read_text(), "original\n")
+            self.assertEqual(finish.call_args.args[3]["verification_outcome"], "partially_verified")
+
+    def test_include_edit_only_adds_standard_include(self):
+        before = '#include <stdio.h>\nint f(void) { return 0; }\n'
+        edit = {"start_line":1, "end_line":1, "original":"#include <stdio.h>\n", "replacement":"#include <stdio.h>\n#include <stdlib.h>\n", "reason":"header", "kind":"include"}
+        self.assertIn("#include <stdlib.h>", app._validate_edits(before, [edit], 19, len(before))[0])
+        edit["replacement"] += "int injected;\n"
+        with self.assertRaises(ValueError):
+            app._validate_edits(before, [edit], 19, len(before))
+
+    def test_retry_apply_and_preserve_existing_copy(self):
+        job_id = "00000000-0000-0000-0000-000000000003"
+        finding_id = "finding-3"
+        source = "int read_value(int *p) { return *p; }\n"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_dir = root / job_id / "source"
+            source_dir.mkdir(parents=True)
+            (source_dir / "main.c").write_bytes(source.encode())
+            finding = {"id": finding_id, "file":"main.c", "line":1, "message":"null dereference", "mapping_confidence":"high", "cwe":{"id":"CWE-476"}}
+            job = {"id":job_id, "owner_id":"owner-a", "state":"complete", "provider":"auto", "findings":[finding]}
+            def proposal(original):
+                return providers.PatchProposal(file="main.c", edits=[providers.RepairEdit(start_line=1, end_line=1, original=original, replacement="return p ? *p : 0;", reason="check pointer")], explanation="Check pointer", security_improvement="Avoid null dereference")
+            with patch.dict(os.environ, {"AUTH_SECRET":"a" * 64}), patch.object(app, "JOBS_ROOT", root), patch.object(app, "get_job", return_value=job), patch.object(app, "_save_job"), patch.object(app, "begin_repair", return_value=True), patch.object(app, "update_repair_operation", return_value=True), patch.object(app, "enqueue_repair", side_effect=lambda jid, opid, repair, proposal: job.update(repair=repair, proposals=[proposal]) or True), patch.object(app, "generate_with_provider", side_effect=[(proposal("missing"), "ollama"), (proposal("return *p;"), "ollama")]) as generate:
+                client = TestClient(app.app)
+                client.cookies.set("patchguard_session", auth.issue_session("owner-a", "a@example.com"))
+                response = client.post(f"/api/jobs/{job_id}/repair/{finding_id}")
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(generate.call_count, 2)
+                self.assertEqual(generate.call_args_list[1].args[0], "ollama")
+                repair_id = response.json()["id"]
+                job["repair"]["state"] = "review_ready"
+                job["repair"]["checks"]["verification_outcome"] = "verified"
+                (source_dir / "main.c").write_text("changed")
+                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
+                (source_dir / "main.c").write_bytes(source.encode())
+                job["repair"]["checks"]["verification_outcome"] = "failed"
+                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
+                job["repair"]["checks"]["verification_outcome"] = "partially_verified"
+                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
+                job["repair"]["checks"]["verification_outcome"] = "verified"
+                applied = client.post(f"/api/jobs/{job_id}/apply/{repair_id}")
+                self.assertEqual(applied.status_code, 200, applied.text)
+                self.assertEqual((source_dir / "main.c").read_bytes(), source.encode())
+                patched = root / job_id / "patched" / "main.c"
+                self.assertIn("p ? *p : 0", patched.read_text())
+                self.assertEqual(client.post(f"/api/jobs/{job_id}/apply/{repair_id}").status_code, 409)
+                self.assertTrue(patched.exists())
 
 class TaxonomyTests(unittest.TestCase):
     def test_only_requested_cwes_are_supported(self):
@@ -275,6 +405,15 @@ class ApiTests(unittest.TestCase):
             client = TestClient(app.app)
             client.cookies.set("patchguard_session", auth.issue_session("test-user", "test@example.com"))
             return client.post("/api/jobs", files={"file": (filename, body)}, data={})
+
+    def test_upload_defaults_to_automatic_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"AUTH_SECRET": "a" * 64}), patch.object(app, "JOBS_ROOT", Path(temp)), patch.object(app, "_save_job") as save:
+                client = TestClient(app.app)
+                client.cookies.set("patchguard_session", auth.issue_session("test-user", "test@example.com"))
+                response = client.post("/api/jobs", files={"file": ("main.c", b"int main(void) { return 0; }\n")})
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(save.call_args.args[0]["provider"], "auto")
 
     def test_upload_accepts_multiple_nested_source_files(self):
         temporary = tempfile.TemporaryDirectory()

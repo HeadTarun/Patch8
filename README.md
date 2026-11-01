@@ -37,9 +37,9 @@ If worker logs report `Network is unreachable` for a `2a05:...` address, the con
 
 ### Repair providers
 
-For Groq repairs, set `GROQ_API_KEY` and optionally `GROQ_MODEL`. The automatic provider tries Ollama and falls back to Groq; scan details report which one generated a proposal. Selecting **Groq Cloud** discloses that relevant source is sent to Groq. The legacy OpenAI-compatible hosted provider remains supported by the API but is not shown in the UI.
+For Groq repairs, set `GROQ_API_KEY` and optionally `GROQ_MODEL`. The automatic provider tries Ollama and falls back to Groq; scan details report which one generated a proposal. If fallback is used, relevant source is sent to Groq. The legacy OpenAI-compatible hosted provider remains supported by the API but is not shown in the UI.
 
-For Ollama, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL`; the API service must be able to reach that Ollama endpoint. The default model is `qwen2.5:3b`. The API uses LangChain's Ollama chat integration with schema-constrained proposals. Source files over `MAX_REPAIR_CONTEXT_CHARS` (24,000 characters by default) are declined rather than truncated. This character limit is a conservative proxy for token use; it is not an exact tokenizer count.
+Start Ollama and run `ollama pull qwen2.5:3b` if the model is missing. For Ollama, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL`; the API service must be able to reach that Ollama endpoint. The default model is `qwen2.5:3b`. The API uses LangChain's Ollama chat integration with schema-constrained proposals. Repairs use bounded source context up to `MAX_REPAIR_CONTEXT_CHARS` (24,000 characters by default) and exact-match edits; the source file itself may be larger. Proposals are limited by `MAX_REPAIR_CHANGED_LINES` and are rechecked against a source hash before application. Context size is a character limit, not an exact token count.
 
 Without model configuration, scanning and reports still work; repair generation explains how to configure a provider.
 
@@ -52,7 +52,7 @@ Uploaded projects and generated artifacts are stored in the `jobs` volume and ex
 ## Supported MVP checks
 
 - C/C++ scans: Clang Static Analyzer and Cppcheck report CWE-476 diagnostics; custom Semgrep rules report risky buffer operations as candidates and map CWE-120/121/122 only from available destination context. Analyzer failures are reported as partial or failed scans.
-- Repairs: automatic Ollama → Groq fallback, manual Ollama or Groq, and legacy hosted OpenAI-compatible chat-completions API; proposals are size- and change-bounded, applied only to a copy, then independently rescanned.
+- Repairs: automatic Ollama → Groq fallback, manual Ollama or Groq, and legacy hosted OpenAI-compatible chat-completions API; proposals are size- and change-bounded, applied only to a copy, then independently rescanned. Proposals created before source hashes were stored must be regenerated. A job with an existing patched copy requires a new scan for another repair.
 - Evidence: build and test checks are attempted only for detected CMake/CTest or Make projects. AddressSanitizer/UndefinedBehaviorSanitizer checks are attempted for CMake projects with tests. Security and overall verification report passed, failed, or unverified; unavailable checks are never passes. Performance comparison is opt-in through a project benchmark manifest.
 - Exports: patch ZIP and SARIF 2.1.0.
 
