@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import io
@@ -7,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import secrets
 import stat
 import tempfile
 import time
@@ -19,15 +21,18 @@ import threading
 from collections import defaultdict, deque
 from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import issue_session, read_session, supabase_auth, supabase_user
-from db import get_job, list_user_jobs, save_job, begin_repair, update_repair_operation, enqueue_repair, recover_repairs
+from db import (begin_repair, enqueue_repair, get_job, list_user_jobs, recover_repairs,
+                reserve_repair_attempt, save_job, update_repair_operation)
 from providers import explain_with_provider, generate_with_provider
 from scanner import sarif_report
 from taxonomy import catalog, get_weakness, supported_weaknesses
+from dotenv import load_dotenv
+load_dotenv()
 
 WORK_ROOT = Path(os.getenv("WORK_ROOT", str(Path(tempfile.gettempdir()) / "patchguard")))
 JOBS_ROOT = WORK_ROOT / "jobs"
@@ -38,15 +43,17 @@ MAX_FILES = int(os.getenv("MAX_PROJECT_FILES", "5000"))
 MAX_EXTRACTED = int(os.getenv("MAX_EXTRACTED_BYTES", "100000000"))
 MAX_SOURCE = int(os.getenv("MAX_SOURCE_BYTES", "200000"))
 MAX_REPAIR_CONTEXT_CHARS = int(os.getenv("MAX_REPAIR_CONTEXT_CHARS", "24000"))
+MAX_DEEP_REPAIR_CONTEXT_CHARS = int(os.getenv("MAX_DEEP_REPAIR_CONTEXT_CHARS", "48000"))
 MAX_EXPLANATION_CONTEXT_CHARS = 6_000
 MAX_REPAIR_CHANGED_LINES = int(os.getenv("MAX_REPAIR_CHANGED_LINES", "200"))
+MAX_REPAIR_ATTEMPTS = 3
+REPAIR_GENERATION_TIMEOUT = 180
 SOURCE_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 HEADER_EXTENSIONS = {".h", ".hh", ".hpp", ".hxx"}
 PROJECT_EXTENSIONS = SOURCE_EXTENSIONS | {".cmake", ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".mk", ".xml", ".sh", ".properties", ".gradle", ".bazel", ".bzl", ".make", ".conf"}
 PROJECT_FILENAMES = {"makefile", "cmakelists.txt", "dockerfile", "meson.build", "meson.options", "configure", "configure.ac", "readme", ".gitignore", ".editorconfig"}
 SKIP_UPLOAD_DIRS = {".git", "node_modules", "build", "dist", "vendor", "venv", ".venv", "__pycache__", "target"}
 app = FastAPI(title="PatchGuard", version="0.1.0", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json")
-
 
 class Credentials(BaseModel):
     email: str = Field(min_length=3, max_length=254)
@@ -55,6 +62,35 @@ class Credentials(BaseModel):
 
 class AuthCallback(BaseModel):
     access_token: str = Field(min_length=20, max_length=8192)
+
+
+class GitHubRepositoriesRequest(BaseModel):
+    provider_token: str = Field(min_length=1, max_length=8192)
+
+
+class GitHubScanRequest(GitHubRepositoriesRequest):
+    full_name: str = Field(min_length=3, max_length=201)
+
+
+class InternalRepairRequest(BaseModel):
+    provider: str
+    context: dict
+
+
+@app.post("/api/internal/repair/generate")
+def internal_repair_generate(payload: InternalRepairRequest, x_repair_secret: str = Header(default="")) -> dict:
+    secret = os.getenv("REPAIR_INTERNAL_SECRET", "")
+    if not secret or not secrets.compare_digest(x_repair_secret, secret):
+        raise HTTPException(404, "Not found.")
+    try:
+        proposal, provider_used = generate_with_provider(payload.provider, payload.context)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    model = (os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b") if payload.provider == "deep"
+             else os.getenv("GROQ_MODEL", "openai/gpt-oss-120b") if provider_used == "groq"
+             else os.getenv("OLLAMA_MODEL", "qwen2.5:3b") if provider_used == "ollama"
+             else os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+    return {"proposal": proposal.model_dump(), "provider_used": provider_used, "model": model}
 
 
 _auth_attempts: dict[tuple[str, str], deque[float]] = defaultdict(deque)
@@ -134,9 +170,120 @@ def github_sign_in() -> RedirectResponse:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     if not base:
         raise HTTPException(503, "Set SUPABASE_URL to enable GitHub sign-in.")
-    callback = os.getenv("FRONTEND_URL", "http://localhost:8000").rstrip("/") + "/auth/callback"
+    callback = os.getenv("FRONTEND_URL", "http://localhost:8000").rstrip("/") + "/auth/callback?source=github"
     params = urllib.parse.urlencode({"provider": "github", "redirect_to": callback})
     return RedirectResponse(f"{base}/auth/v1/authorize?{params}", status_code=302)
+
+
+def _github_request(path: str, token: str, max_bytes: int = 5_000_000) -> bytes:
+    if not token or any(ord(character) < 33 or ord(character) > 126 for character in token):
+        raise HTTPException(401, "GitHub authorization is missing. Sign in with GitHub again.")
+    request = urllib.request.Request(
+        "https://api.github.com" + path,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "PatchGuard-MVP",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            host = urllib.parse.urlsplit(response.geturl()).hostname
+            if host != "api.github.com":
+                raise HTTPException(502, "GitHub returned an unexpected API location.")
+            data = response.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise HTTPException(401, "GitHub authorization expired. Sign in with GitHub again.") from exc
+        if exc.code == 403 and (exc.headers or {}).get("X-RateLimit-Remaining") == "0":
+            raise HTTPException(429, "GitHub API rate limit reached. Try again later.") from exc
+        if exc.code == 403:
+            raise HTTPException(403, "GitHub denied access. Only public repositories are supported.") from exc
+        if exc.code == 404:
+            raise HTTPException(404, "Public GitHub repository or branch was not found.") from exc
+        raise HTTPException(502, "GitHub could not complete the request.") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(502, "Could not reach GitHub. Try again.") from exc
+    if len(data) > max_bytes:
+        raise HTTPException(413, "GitHub repository archive exceeds the upload size limit.")
+    return data
+
+
+def _github_archive(owner: str, repo: str, sha: str) -> bytes:
+    url = f"https://codeload.github.com/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}/zip/{sha}"
+    request = urllib.request.Request(url, headers={"Accept": "application/zip", "User-Agent": "PatchGuard-MVP"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if urllib.parse.urlsplit(response.geturl()).hostname != "codeload.github.com":
+                raise HTTPException(502, "GitHub returned an unexpected archive location.")
+            data = response.read(MAX_UPLOAD + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise HTTPException(404, "Public GitHub repository or commit was not found.") from exc
+        if exc.code == 429:
+            raise HTTPException(429, "GitHub is temporarily rate limiting archive downloads. Try again later.") from exc
+        raise HTTPException(502, "GitHub could not download this repository snapshot.") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(502, "Could not download this GitHub repository. Try again.") from exc
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(413, "GitHub repository archive exceeds the upload size limit.")
+    return data
+
+
+def _github_json(path: str, token: str):
+    try:
+        result = json.loads(_github_request(path, token).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(502, "GitHub returned an invalid response.") from exc
+    return result
+
+
+def _github_repo_path(full_name: str) -> tuple[str, str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", full_name):
+        raise HTTPException(400, "Choose a valid public GitHub repository.")
+    owner, repo = full_name.split("/", 1)
+    return owner, repo, f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}"
+
+
+def _github_snapshot(provider_token: str, full_name: str) -> tuple[bytes, dict]:
+    owner, repo_name, repo_path = _github_repo_path(full_name)
+    repo = _github_json(repo_path, provider_token)
+    if not isinstance(repo, dict) or repo.get("private"):
+        raise HTTPException(404, "Only public GitHub repositories can be scanned.")
+    branch = repo.get("default_branch")
+    if not isinstance(branch, str) or not branch:
+        raise HTTPException(422, "GitHub repository does not have a default branch.")
+    commit = _github_json(f"{repo_path}/commits/{urllib.parse.quote(branch, safe='')}", provider_token)
+    sha = commit.get("sha") if isinstance(commit, dict) else None
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        raise HTTPException(502, "GitHub did not return a valid commit for the default branch.")
+    archive = _github_archive(owner, repo_name, sha)
+    metadata = {"type": "github", "repository": f"{owner}/{repo_name}", "branch": branch, "commit_sha": sha}
+    return archive, metadata
+
+
+@app.post("/api/github/repositories")
+def github_repositories(payload: GitHubRepositoriesRequest, request: Request) -> dict:
+    _current_user(request)
+    _auth_rate_limit(request, "github_repositories", 60)
+    repositories = _github_json("/user/repos?visibility=public&sort=updated&per_page=100", payload.provider_token)
+    if not isinstance(repositories, list):
+        raise HTTPException(502, "GitHub returned an invalid repository list.")
+    return {"repositories": [
+        {"full_name": item["full_name"], "default_branch": item["default_branch"], "description": item.get("description"), "updated_at": item.get("updated_at")}
+        for item in repositories
+        if isinstance(item, dict) and not item.get("private") and isinstance(item.get("full_name"), str) and isinstance(item.get("default_branch"), str) and item["full_name"] and item["default_branch"]
+    ]}
+
+
+@app.post("/api/github/scan", status_code=202)
+async def github_scan(payload: GitHubScanRequest, request: Request) -> dict:
+    _current_user(request)
+    _auth_rate_limit(request, "github_scan", 20)
+    archive, source = await asyncio.to_thread(_github_snapshot, payload.provider_token, payload.full_name)
+    upload = UploadFile(file=io.BytesIO(archive), filename=f"{source['repository'].split('/')[-1]}.zip")
+    return await _create_job(request, [upload], "auto", source)
 
 
 @app.get("/api/auth/demo/status")
@@ -211,19 +358,21 @@ def _repair_path(job_id: str, repair_id: str) -> Path:
     return JOBS_ROOT / job_id / "repairs" / f"{repair_id}.json"
 
 
-def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Path, target: Path) -> dict:
+def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Path, target: Path, deep: bool = False, verification_feedback: str = "No previous verification results.") -> dict:
     lines = before.splitlines(keepends=True)
     line = int(finding["line"])
     if line < 1 or line > len(lines):
         raise HTTPException(422, "Finding location is outside the source file.")
-    start, end = max(0, line - 41), min(len(lines), line + 40)
-    while sum(map(len, lines[start:end])) > MAX_REPAIR_CONTEXT_CHARS and end - start > 1:
+    context_limit = MAX_DEEP_REPAIR_CONTEXT_CHARS if deep else MAX_REPAIR_CONTEXT_CHARS
+    radius = 120 if deep else 40
+    start, end = max(0, line - radius - 1), min(len(lines), line + radius)
+    while sum(map(len, lines[start:end])) > context_limit and end - start > 1:
         if line - start > end - line:
             start += 1
         else:
             end -= 1
     localized = "".join(lines[start:end])
-    if len(localized) > MAX_REPAIR_CONTEXT_CHARS:
+    if len(localized) > context_limit:
         raise HTTPException(413, "Finding line exceeds the configured repair context limit.")
     headers = []
     header_chars = 0
@@ -257,6 +406,7 @@ def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Pa
         "source": localized,
         "numbered_source": "".join(f"{n}: {text}" for n, text in enumerate(lines[start:end], start + 1)),
         "retry_feedback": "None",
+        "verification_feedback": verification_feedback[:8_000] if deep else "No previous verification results.",
         "scope_start": sum(map(len, lines[:start])),
         "scope_end": sum(map(len, lines[:end])),
         "scope_start_line": start + 1,
@@ -267,6 +417,8 @@ def _build_repair_context(before: str, finding: dict, cwe: dict, source_root: Pa
 
 
 def _validate_edits(before: str, edits: list[dict], scope_start: int, scope_end: int) -> tuple[str, list[dict], int, int]:
+    if not edits:
+        raise ValueError("no_change: Repair contains no source edits.")
     spans = []
     lines = before.splitlines(keepends=True)
     endings = {"crlf" if line.endswith("\r\n") else "lf" for line in lines if line.endswith("\n")}
@@ -289,7 +441,7 @@ def _validate_edits(before: str, edits: list[dict], scope_start: int, scope_end:
             raise ValueError(f"missing_context: Edit {index + 1} has no expected source text.")
         position = normalized.find(expected)
         if position < 0:
-            raise ValueError(f"text_mismatch: Edit {index + 1} does not match lines {first}-{last}.")
+            raise ValueError(f"missing_context: Edit {index + 1} does not match lines {first}-{last}.")
         if normalized.find(expected, position + 1) >= 0:
             raise ValueError(f"ambiguous_context: Edit {index + 1} matches more than once in its declared range.")
         start = range_start + len(normalized[:position].replace("\n", newline))
@@ -302,7 +454,7 @@ def _validate_edits(before: str, edits: list[dict], scope_start: int, scope_end:
                 raise ValueError("include_context: Include edit must anchor to one existing include line.")
             extra = replacement.removeprefix(original)
             if not replacement.startswith(original) or not re.fullmatch(r'[ \t]*#[ \t]*include[ \t]*<[^>\r\n]+>[ \t]*(?:\r?\n)', extra):
-                raise ValueError("include_context: Include edit must only add one standard include.")
+                raise ValueError("include_context: Include edit must only add one standard include after its anchor.")
         elif kind != "code" or start < scope_start or end > scope_end:
             raise ValueError(f"scope_violation: Edit {index + 1} exceeds the localized repair scope.")
         if original == replacement:
@@ -323,6 +475,57 @@ def _validate_edits(before: str, edits: list[dict], scope_start: int, scope_end:
     if max(added, deleted) > MAX_REPAIR_CHANGED_LINES:
         raise ValueError("size_limit: Repair exceeds the configured changed-line limit.")
     return after, [{**edit, "start": start, "end": end, "line": before.count("\n", 0, start) + 1} for start, end, edit in spans], added, deleted
+
+
+def _rejected_attempt(exc: Exception, result, before: str, attempt: int) -> dict:
+    technical = str(exc)[:500]
+    code = technical.split(":", 1)[0]
+    if code not in {"missing_context", "text_mismatch", "wrong_range", "ambiguous_context", "overlap", "scope_violation", "include_context", "no_change", "size_limit", "mixed_line_endings", "invalid_path"}:
+        code = "provider_unavailable" if isinstance(exc, RuntimeError) else "invalid_schema"
+    match = re.search(r"Edit (\d+)", technical)
+    edit_index = int(match.group(1)) if match else None
+    snippets = []
+    budget = 12_000
+    for index, edit in enumerate(result.edits if result else []):
+        if index >= 8 or budget <= 0:
+            break
+        first, last = edit.start_line, edit.end_line
+        source_lines = before.splitlines(keepends=True)
+        actual = "".join(source_lines[first - 1:last]) if 1 <= first <= last <= len(source_lines) else ""
+        limit = min(2_000, budget // 3)
+        snippets.append({"edit_index": index + 1, "start_line": first, "end_line": last,
+                         "actual": actual[:limit], "expected": edit.original[:limit],
+                         "replacement": edit.replacement[:limit], "reason": edit.reason[:500],
+                         "truncated": any(len(value) > limit for value in (actual, edit.original, edit.replacement))})
+        budget -= sum(len(snippets[-1][key]) for key in ("actual", "expected", "replacement"))
+    failed = next((item for item in snippets if item["edit_index"] == edit_index), None)
+    location = f" at line {failed['start_line']}" if failed else ""
+    message = (f"The AI suggested replacing code that does not match your uploaded file{location}."
+               if code in ("text_mismatch", "missing_context", "ambiguous_context", "wrong_range")
+               else "The suggestion did not pass the repair safety checks.")
+    if code == "provider_unavailable":
+        message = "The AI provider could not generate a suggestion. Check provider availability or try again later."
+    if attempt >= MAX_REPAIR_ATTEMPTS:
+        message += " The suggestion limit has been reached; human review is required."
+    message += " Your original code is unchanged. Build and security verification have not started."
+    return {"attempt": attempt, "at": time.time(), "code": code,
+            "stage": "generating" if code == "provider_unavailable" else "checking edits",
+            "edit_index": edit_index, "start_line": failed["start_line"] if failed else None,
+            "end_line": failed["end_line"] if failed else None, "message": message,
+            "technical": technical, "retryable": attempt < MAX_REPAIR_ATTEMPTS, "edits": snippets}
+
+
+def _tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("Candidate contains a symbolic link.")
+        if path.is_file():
+            name = path.relative_to(root).as_posix().encode("utf-8")
+            digest.update(len(name).to_bytes(8, "big")); digest.update(name)
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "big")); digest.update(content)
+    return digest.hexdigest()
 
 
 def _changed_line_count(before: str, after: str) -> int:
@@ -358,7 +561,8 @@ def providers_status() -> dict:
         "providers": {
             "auto": {"configured": ollama_configured or groq_configured, "label": "Automatic (Ollama → Groq)"},
             "ollama": {"configured": ollama_configured, "available": ollama_available, "model_available": ollama_model_available, "model": ollama_model},
-            "groq": {"configured": groq_configured, "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")},
+            "groq": {"configured": groq_configured, "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+                     "deep_model": os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b")},
             "none": {"configured": True, "label": "Scan only"},
         }
     }
@@ -397,6 +601,10 @@ def weaknesses() -> dict:
 @app.post("/api/jobs", status_code=202)
 async def create_job(request: Request, files: list[UploadFile] = File(default=[]), file: UploadFile | None = File(default=None), provider: str = Form("auto")) -> dict:
     uploads = files or ([file] if file else [])
+    return await _create_job(request, uploads, provider)
+
+
+async def _create_job(request: Request, uploads: list[UploadFile], provider: str, source_metadata: dict | None = None) -> dict:
     if not uploads:
         raise HTTPException(400, "Choose source files or a ZIP project.")
     if len(uploads) > MAX_FILES:
@@ -505,10 +713,11 @@ async def create_job(request: Request, files: list[UploadFile] = File(default=[]
 
     upload_kind = "zip" if is_zip else ("source" if len(uploads) == 1 and len(PurePosixPath(names[0]).parts) == 1 else "project")
     job = {
-        "id": job_id, "owner_id": user["id"], "name": Path(names[0]).name, "provider": provider,
+        "id": job_id, "owner_id": user["id"], "name": source_metadata.get("repository", Path(names[0]).name) if source_metadata else Path(names[0]).name, "provider": provider,
         "upload_kind": upload_kind,
         "upload_filename": names[0] if upload_kind == "source" else None,
         "uploaded_files": [PurePosixPath(path).as_posix() for path in names],
+        **({"source": source_metadata} if source_metadata else {}),
         "state": "queued", "created_at": created_at, "expires_at": created_at + JOB_TTL,
         "findings": [], "checks": {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "performance": "not_measured"},
     }
@@ -530,6 +739,40 @@ def job_files(job_id: str, request: Request) -> dict:
     _read_job(job_id, _current_user(request)["id"])
     root = JOBS_ROOT / job_id / "source"
     return {"files": sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()) if root.is_dir() else []}
+
+
+@app.get("/api/jobs/{job_id}/source")
+def project_source(job_id: str, request: Request, path: str) -> dict:
+    job = _read_job(job_id, _current_user(request)["id"])
+    relative = PurePosixPath(path.replace("\\", "/"))
+    if relative.is_absolute() or not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise HTTPException(400, "Invalid source path.")
+    if Path(relative.name).suffix.lower() not in SOURCE_EXTENSIONS:
+        raise HTTPException(415, "Only C/C++ source files can be previewed.")
+    root = (JOBS_ROOT / job_id / "source").resolve()
+    target = (root / Path(*relative.parts)).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(404, "Source preview is unavailable or has expired.")
+    if target.stat().st_size > MAX_SOURCE:
+        raise HTTPException(413, "Source file is too large to preview.")
+    try:
+        data = target.read_bytes()
+        content = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(422, "Source preview requires UTF-8 text.") from exc
+    return {"file": relative.as_posix(), "original": content,
+            "source_hash": hashlib.sha256(data).hexdigest(),
+            "expires_at": job.get("expires_at")}
+
+
+@app.get("/api/jobs/{job_id}/findings/{finding_id}/source")
+def finding_source(job_id: str, finding_id: str, request: Request) -> dict:
+    job = _read_job(job_id, _current_user(request)["id"])
+    finding = next((item for item in job.get("findings", []) if item.get("id") == finding_id), None)
+    if not finding:
+        raise HTTPException(404, "Finding not found.")
+    source = project_source(job_id, request, finding["file"])
+    return {**source, "line": finding["line"]}
 
 
 @app.get("/api/jobs/{job_id}/findings/{finding_id}")
@@ -617,7 +860,47 @@ def mark_false_positive(job_id: str, finding_id: str, request: Request) -> dict:
 
 
 def _proposal_summary(repair: dict) -> dict:
-    return {key: repair[key] for key in ("id", "finding_id", "file", "diff", "explanation", "provider_used", "state", "metadata") if key in repair}
+    return {key: repair[key] for key in ("id", "finding_id", "mode", "file", "diff", "explanation", "provider_used", "model_used", "state", "metadata", "review") if key in repair}
+
+
+@app.get("/api/jobs/{job_id}/repair-status")
+def repair_status(job_id: str, request: Request, finding_id: str | None = None) -> dict:
+    user_id = _current_user(request)["id"]
+    recover_repairs(job_id)
+    job = _read_job(job_id, user_id)
+    job_operation = job.get("repair_operation") or {}
+    operation = job_operation
+    if finding_id and operation.get("finding_id") != finding_id:
+        operation = {}
+    repair = job.get("repair") or {}
+    if finding_id and repair.get("finding_id") != finding_id:
+        repair = {}
+    preview = None
+    if repair.get("id") and repair.get("file"):
+        try:
+            original = project_source(job_id, request, repair["file"])["original"]
+            preview = {"original": original, "proposed": repair.get("code", ""),
+                       "line": (repair.get("metadata") or {}).get("line")}
+        except HTTPException:
+            pass
+    counts = job.get("repair_attempt_counts", {})
+    history = job.get("repair_attempt_history", {})
+    attempts = history.get(finding_id, []) if finding_id else operation.get("attempts", [])
+    active = job_operation.get("status") in ("queued", "running", "verifying")
+    last_operation = job_operation if not finding_id or job_operation.get("finding_id") == finding_id else {}
+    last_failed = last_operation.get("status") in ("failed", "timed_out", "human_review") or repair.get("state") == "verification_failed"
+    attempts_used = int(counts.get(finding_id, 0)) if finding_id else int(operation.get("attempt_count", 0))
+    return {"job_busy": active, "scan_provider": job.get("provider", "none"),
+            "attempt_count": attempts_used,
+            "max_attempts": MAX_REPAIR_ATTEMPTS,
+            "deep_repair_available": bool(os.getenv("GROQ_API_KEY")) and (last_failed or (job.get("provider") == "none" and attempts_used == 0)) and attempts_used < MAX_REPAIR_ATTEMPTS and not active,
+            "deep_repair_configured": bool(os.getenv("GROQ_API_KEY")),
+            "deep_model": os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b"),
+            "attempt_history": attempts,
+            "operation": operation,
+            "repair": _proposal_summary(repair) if repair else None,
+            "checks": repair.get("checks") if repair else None,
+            "preview": preview}
 
 
 @app.get("/api/jobs/{job_id}/repair/{finding_id}")
@@ -629,98 +912,34 @@ def get_repair(job_id: str, finding_id: str, request: Request) -> dict:
     return proposal
 
 
-@app.get("/api/jobs/{job_id}/findings/{finding_id}/source")
-def finding_source(job_id: str, finding_id: str, request: Request) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
-    finding = next((f for f in job.get("findings", []) if f["id"] == finding_id), None)
-    if not finding:
-        raise HTTPException(404, "Finding not found.")
-    root = (JOBS_ROOT / job_id / "source").resolve()
-    target = (root / finding["file"]).resolve()
-    if not target.is_relative_to(root) or not target.is_file() or target.stat().st_size > 200_000:
-        raise HTTPException(404, "Source preview is unavailable or has expired.")
-    data = target.read_bytes()
-    return {"file": finding["file"], "line": finding["line"], "original": data.decode("utf-8", errors="replace"), "source_hash": hashlib.sha256(data).hexdigest(), "expires_at": job.get("expires_at")}
-
-
-@app.get("/api/jobs/{job_id}/repair-status")
-def repair_status(job_id: str, request: Request, finding_id: str | None = None) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
+@app.post("/api/jobs/{job_id}/repair/{finding_id}", status_code=202)
+def create_repair(job_id: str, finding_id: str, request: Request, mode: str = "standard") -> dict:
+    user_id = _current_user(request)["id"]
     recover_repairs(job_id)
-    job = _read_job(job_id, _current_user(request)["id"])
-    operation = job.get("repair_operation") or {}
-    active = operation.get("status") in ("running", "queued", "verifying")
-    repair = job.get("repair") or {}
-    if finding_id and operation.get("finding_id") != finding_id:
-        operation = {}
-    if (finding_id and repair.get("finding_id") != finding_id) or (operation and repair.get("operation_id") != operation.get("id")):
-        repair = {}
-    preview = None
-    if repair.get("id") and repair.get("file"):
-        source_root = JOBS_ROOT / job_id / "source"
-        original = (source_root / repair["file"]).resolve()
-        if original.is_relative_to(source_root.resolve()) and original.is_file():
-            preview = {"original": original.read_text(encoding="utf-8", errors="replace"), "proposed": repair.get("code", ""), "line": (repair.get("metadata") or {}).get("line")}
-    return {"operation": operation, "job_busy": active, "repair": _proposal_summary(repair) if repair else None, "checks": repair.get("checks") if repair else None, "preview": preview}
-
-
-def _rejected_attempt(exc: Exception, result, before: str, attempt: int) -> dict:
-    technical = str(exc)[:500]
-    code = technical.split(":", 1)[0]
-    if code not in {"missing_context", "text_mismatch", "wrong_range", "ambiguous_context", "overlap", "scope_violation", "include_context", "no_change", "size_limit", "mixed_line_endings", "invalid_path"}:
-        code = "provider_unavailable" if isinstance(exc, RuntimeError) else "invalid_schema"
-    match = re.search(r"Edit (\d+)", technical)
-    edit_index = int(match.group(1)) if match else None
-    snippets = []
-    budget = 12000
-    for index, edit in enumerate(result.edits if result else []):
-        if index >= 8 or budget <= 0:
-            break
-        first, last = edit.start_line, edit.end_line
-        actual = "".join(before.splitlines(keepends=True)[first - 1:last]) if 1 <= first <= last <= len(before.splitlines()) else ""
-        limit = min(2000, budget // 3)
-        snippets.append({"edit_index": index + 1, "start_line": first, "end_line": last, "actual": actual[:limit], "expected": edit.original[:limit], "replacement": edit.replacement[:limit], "reason": edit.reason[:500], "truncated": any(len(s) > limit for s in (actual, edit.original, edit.replacement))})
-        budget -= sum(len(snippets[-1][key]) for key in ("actual", "expected", "replacement"))
-    failed = next((s for s in snippets if s["edit_index"] == edit_index), None)
-    location = f" at line {failed['start_line']}" if failed else ""
-    message = (f"The AI suggested replacing code that does not match your uploaded file{location}." if code in ("text_mismatch", "missing_context", "ambiguous_context", "wrong_range") else "The suggestion did not pass the repair safety checks.")
-    if code == "provider_unavailable":
-        message = "The AI provider could not generate a suggestion. Check provider availability or try again later."
-    if attempt == 2:
-        message += " A second attempt also failed."
-    message += " Your original code is unchanged. Build and security verification have not started."
-    return {"attempt": attempt, "at": time.time(), "code": code, "stage": "generating" if code == "provider_unavailable" else "checking edits", "edit_index": edit_index, "start_line": failed["start_line"] if failed else None, "end_line": failed["end_line"] if failed else None, "message": message, "technical": technical, "retryable": True, "edits": snippets}
-
-
-def _tree_hash(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("Candidate contains a symbolic link.")
-        if path.is_file():
-            name = path.relative_to(root).as_posix().encode("utf-8")
-            digest.update(len(name).to_bytes(8, "big")); digest.update(name)
-            content = path.read_bytes()
-            digest.update(len(content).to_bytes(8, "big")); digest.update(content)
-    return digest.hexdigest()
-
-@app.post("/api/jobs/{job_id}/repair/{finding_id}")
-def create_repair(job_id: str, finding_id: str, request: Request) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
+    job = _read_job(job_id, user_id)
     if job["state"] != "complete":
         raise HTTPException(409, "Wait for the scan to finish before generating a repair.")
-    if job["provider"] == "none":
+    if mode not in ("standard", "deep"):
+        raise HTTPException(400, "Choose standard or deep repair.")
+    if mode == "deep" and not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(409, "Deep repair requires Groq. Configure GROQ_API_KEY first.")
+    if mode == "standard" and job["provider"] == "none":
         raise HTTPException(409, "This scan was created without AI. Start a new scan to request a repair.")
     finding = next((item for item in job.get("findings", []) if item["id"] == finding_id), None)
     if not finding:
         raise HTTPException(404, "Finding not found.")
     if finding.get("status") == "false_positive":
         raise HTTPException(409, "False-positive findings do not support automated repair.")
-    if (JOBS_ROOT / job_id / "patched").exists():
-        raise HTTPException(409, "A working copy already exists. Download it or start a new scan.")
-    existing = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") in ("validating", "review_ready")), None)
+    existing = next((item for item in job.get("proposals", []) if item.get("finding_id") == finding_id and item.get("state") in ("proposed", "validating", "review_ready")), None)
     if existing:
-        return existing
+        if existing.get("state") in ("validating", "review_ready"):
+            return {"id": existing["id"], "state": existing["state"], "operation_id": (job.get("repair_operation") or {}).get("id")}
+    if mode == "deep":
+        previous = job.get("repair_operation") or {}
+        failed = previous.get("finding_id") == finding_id and previous.get("status") in ("failed", "timed_out", "human_review")
+        failed = failed or (job.get("repair", {}).get("finding_id") == finding_id and job.get("repair", {}).get("state") == "verification_failed")
+        if job.get("provider") != "none" and not failed:
+            raise HTTPException(409, "Try a standard repair first. Deep repair is available after it fails.")
     if not finding.get("cwe"):
         raise HTTPException(409, "Suspicious candidates need manual review and do not support automated repair.")
     source_root = JOBS_ROOT / job_id / "source"
@@ -736,84 +955,72 @@ def create_repair(job_id: str, finding_id: str, request: Request) -> dict:
     cwe = get_weakness(finding["cwe"]["id"])
     if not cwe:
         raise HTTPException(400, "CWE mapping could not be loaded.")
-    context = _build_repair_context(before, finding, cwe, source_root, target)
+    previous_repair = job.get("repair") or {}
+    feedback = "No previous verification results."
+    if mode == "deep":
+        checks = previous_repair.get("checks", {}) if previous_repair.get("finding_id") == finding_id else {}
+        feedback = json.dumps({"checks": checks, "attempts": job.get("repair_attempt_history", {}).get(finding_id, []),
+                               "previous_error": (job.get("repair_operation") or {}).get("error"),
+                               "security_details": checks.get("security_details"), "build_details": checks.get("details")}, ensure_ascii=False)[:8_000]
+    context = _build_repair_context(before, finding, cwe, source_root, target, deep=mode == "deep", verification_feedback=feedback)
+    if mode == "standard":
+        history = job.get("repair_attempt_history", {}).get(finding_id, [])
+        if history:
+            latest = history[-1]
+            context["retry_feedback"] = f"Previous repair was rejected: {latest.get('technical', latest.get('message', 'No details'))}. " + json.dumps(latest.get("edits", []), ensure_ascii=False)[:12_000]
+    used_attempts = int(job.get("repair_attempt_counts", {}).get(finding_id, 0))
+    if used_attempts >= MAX_REPAIR_ATTEMPTS:
+        raise HTTPException(409, "The three-suggestion limit has been reached. Human review is required.")
+    now = time.time()
     operation_id = str(uuid.uuid4())
-    operation = {"id": operation_id, "finding_id": finding_id, "stage": "locating code", "status": "running", "started_at": time.time(), "deadline": time.time() + 400, "attempt": 0, "events": [{"at": time.time(), "stage": "locating code", "status": "running"}], "scope_start_line": context["scope_start_line"], "scope_end_line": context["scope_end_line"]}
-    if not begin_repair(job_id, _current_user(request)["id"], operation):
-        raise HTTPException(409, "Another repair is already in progress. View its status.")
-    chosen_provider = job["provider"]
-    attempts = []
-    for attempt in range(2):
-        result = None
-        try:
-            update_repair_operation(job_id, operation_id, {"stage": "generating" if attempt == 0 else "retrying", "attempt": attempt + 1})
-            result, provider_used = generate_with_provider(chosen_provider, context, on_event=lambda event: update_repair_operation(job_id, operation_id, event))
-            chosen_provider = provider_used
-            update_repair_operation(job_id, operation_id, {"stage": "checking edits", "provider": provider_used})
-            if result.file != finding["file"]:
-                raise ValueError("invalid_path: Repair targets a different file.")
-            after, edits, added, deleted = _validate_edits(before, [edit.model_dump() for edit in result.edits], context["scope_start"], context["scope_end"])
-            break
-        except (ValueError, RuntimeError) as exc:
-            detail = _rejected_attempt(exc, result, before, attempt + 1)
-            attempts.append(detail)
-            update_repair_operation(job_id, operation_id, {"attempts": attempts, "error_detail": detail})
-            if attempt == 1:
-                update_repair_operation(job_id, operation_id, {"stage": detail["stage"], "status": "failed", "error": detail["message"]})
-                raise HTTPException(422, detail) from exc
-            context["retry_feedback"] = f"{detail['technical']} Allowed source lines: {context['scope_start_line']}-{context['scope_end_line']}. Use absolute line numbers and exact original text, including indentation. Actual source at failed ranges: {json.dumps(detail['edits'])[:12000]}"
-    diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=f"a/{finding['file']}", tofile=f"b/{finding['file']}"))
-    repair_id = str(uuid.uuid4())
-    metadata = {"line": finding["line"], "scope_start_line": context["scope_start_line"], "scope_end_line": context["scope_end_line"], "localization": "bounded line window", "added_lines": added, "deleted_lines": deleted, "reasons": [edit["reason"] for edit in edits], "security_improvement": result.security_improvement, "warnings": ["Function boundaries were not established; scope is based on nearby lines."]}
-    repair = {"id": repair_id, "finding_id": finding_id, "file": finding["file"], "code": after, "diff": diff, "explanation": result.explanation, "provider_used": provider_used, "state": "proposed", "created_at": time.time(), "source_hash": hashlib.sha256(before.encode("utf-8")).hexdigest(), "scope_start": context["scope_start"], "scope_end": context["scope_end"], "edits": edits, "metadata": metadata}
-    repair["operation_id"] = operation_id
-    update_repair_operation(job_id, operation_id, {"stage": "preparing candidate", "error_detail": None})
-    candidate_root = JOBS_ROOT / job_id / "candidates" / repair_id
-    try:
-        candidate_root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_root, candidate_root)
-        candidate_target = (candidate_root / repair["file"]).resolve()
-        if not candidate_target.is_relative_to(candidate_root.resolve()):
-            raise ValueError("Invalid candidate path.")
-        candidate_target.write_bytes(after.encode("utf-8"))
-        repair["candidate_hash"] = _tree_hash(candidate_root)
-        repair["state"] = "validating"
-        repair["checks"] = {"build": "pending", "tests": "pending", "sanitizers": "pending", "security": "pending", "verification": "pending", "performance": "not_measured"}
-        repair_dir = JOBS_ROOT / job_id / "repairs"
-        repair_dir.mkdir(parents=True, exist_ok=True)
-        _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
-        if not enqueue_repair(job_id, operation_id, repair, _proposal_summary(repair)):
-            raise ValueError("Repair operation expired or was replaced.")
-    except Exception as exc:
-        shutil.rmtree(candidate_root, ignore_errors=True)
-        update_repair_operation(job_id, operation_id, {"stage": "failed", "status": "failed", "error": "Could not prepare repair candidate."})
-        raise HTTPException(409, "Could not prepare repair candidate; retry the repair.") from exc
-    return _proposal_summary(repair)
+    operation = {"id": operation_id, "finding_id": finding_id, "mode": mode, "stage": "queued for deep repair" if mode == "deep" else "queued for generation",
+                 "status": "queued", "started_at": now, "deadline": now + REPAIR_GENERATION_TIMEOUT,
+                 "attempt": used_attempts, "attempt_count": used_attempts,
+                 "attempts": job.get("repair_attempt_history", {}).get(finding_id, []),
+                 "scope_start_line": context["scope_start_line"], "scope_end_line": context["scope_end_line"],
+                 "events": [{"at": now, "stage": "queued for deep repair" if mode == "deep" else "queued for generation", "status": "queued",
+                             **({"provider": "groq", "model": os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b")} if mode == "deep" else {})}]}
+    if mode == "deep":
+        operation.update(provider="groq", model=os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b"))
+    if not begin_repair(job_id, user_id, operation):
+        current = _read_job(job_id, user_id).get("repair_operation") or {}
+        if current.get("status") in ("queued", "running", "verifying"):
+            raise HTTPException(409, "Another repair is already in progress. View its status.")
+        raise HTTPException(409, "The repair could not be queued. Refresh the scan and retry.")
+    return {"id": operation_id, "operation_id": operation_id, "finding_id": finding_id,
+            "state": "queued", "status": "queued"}
 
 
 @app.post("/api/jobs/{job_id}/repair/{repair_id}/reject")
 def reject_repair(job_id: str, repair_id: str, request: Request) -> dict:
-    _read_job(job_id, _current_user(request)["id"])
+    job = _read_job(job_id, _current_user(request)["id"])
     path = _repair_path(job_id, repair_id)
     try:
         repair = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(404, "Repair proposal not found.") from exc
-    if repair.get("state") != "proposed":
-        raise HTTPException(409, "Only a proposed repair can be rejected.")
+    current = job.get("repair") or {}
+    if current.get("id") == repair_id:
+        repair.update(current)
+    if repair.get("state") not in ("proposed", "review_ready", "verification_failed"):
+        raise HTTPException(409, "Only a completed repair proposal can be rejected.")
     repair["state"] = "rejected"
     path.write_text(json.dumps(repair), encoding="utf-8")
-    job = _read_job(job_id, _current_user(request)["id"])
     for proposal in job.get("proposals", []):
         if proposal.get("id") == repair_id:
             proposal["state"] = "rejected"
+    if job.get("repair", {}).get("id") == repair_id:
+        job["repair"]["state"] = "rejected"
+        operation = job.get("repair_operation") or {}
+        operation.update(status="complete", stage="review rejected", finished_at=time.time())
     _save_job(job)
     return {"id": repair_id, "state": "rejected"}
 
 
 @app.post("/api/jobs/{job_id}/apply/{repair_id}")
-def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial: bool = False) -> dict:
-    job = _read_job(job_id, _current_user(request)["id"])
+def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial: bool = False, confirm_human_review: bool = False) -> dict:
+    user_id = _current_user(request)["id"]
+    job = _read_job(job_id, user_id)
     repair_path = _repair_path(job_id, repair_id)
     try:
         repair = json.loads(repair_path.read_text(encoding="utf-8"))
@@ -825,8 +1032,12 @@ def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial:
     outcome = (current.get("checks") or {}).get("verification_outcome", "not_verified")
     if outcome not in ("verified", "partially_verified"):
         raise HTTPException(409, "This repair cannot be accepted because verification failed or is unavailable.")
+    if not confirm_human_review:
+        raise HTTPException(409, "Review the original and proposed code and diagnostics before accepting this repair.")
     if outcome == "partially_verified" and not confirm_partial:
         raise HTTPException(409, "Confirm acceptance with unavailable checks before continuing.")
+    repair.update(current)
+    repair["review"] = {"reviewed_by": user_id, "reviewed_at": time.time(), "verification_outcome": outcome}
     source_root = JOBS_ROOT / job_id / "source"
     target = (source_root / repair.get("file", "")).resolve()
     if not target.is_relative_to(source_root.resolve()) or not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != repair.get("source_hash"):
@@ -836,23 +1047,22 @@ def apply_repair(job_id: str, repair_id: str, request: Request, confirm_partial:
         raise HTTPException(409, "The verified candidate changed or expired. Generate a new repair.")
     patched_root = JOBS_ROOT / job_id / "patched"
     try:
-        patched_root.mkdir()
+        os.rename(candidate, patched_root)
     except FileExistsError as exc:
         raise HTTPException(409, "A working copy already exists. Download it or start a new scan.") from exc
-    try:
-        os.rename(candidate, patched_root)
-    except Exception:
-        patched_root.rmdir()
-        raise
     repair["state"] = "applied_to_copy"
     _repair_path(job_id, repair_id).write_text(json.dumps(repair), encoding="utf-8")
-    job["repair"]["state"] = "applied_to_copy"
+    job["repair"].update(state="applied_to_copy", review=repair["review"])
     job["progress"] = "Verified candidate accepted to working copy"
     for proposal in job.get("proposals", []):
         if proposal.get("id") == repair_id:
-            proposal["state"] = "applied_to_copy"
+            proposal.update(state="applied_to_copy", review=repair["review"])
+    operation = job.get("repair_operation") or {}
+    if operation.get("id") == repair.get("operation_id"):
+        operation.update(status="complete", stage="review complete", finished_at=time.time())
+        operation["events"] = (operation.get("events", []) + [{"at": time.time(), "stage": "review complete", "status": "complete"}])[-100:]
     _save_job(job)
-    return {"state": "applied_to_copy", "download": f"/api/jobs/{job_id}/download", "checks": current["checks"]}
+    return {"state": "applied_to_copy", "download": f"/api/jobs/{job_id}/download", "checks": current["checks"], "review": repair["review"]}
 
 
 @app.get("/api/jobs/{job_id}/sarif")

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import difflib
 import logging
+import multiprocessing
 import os
+import queue
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -10,10 +16,20 @@ import statistics
 import tempfile
 import time
 import threading
+import urllib.error
+import urllib.request
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from db import claim_job, delete_expired_jobs, get_job, save_job, update_repair_operation, finish_repair
+from db import (claim_job, claim_repair_generation, delete_expired_jobs, enqueue_repair,
+                finish_repair, get_job, recover_repairs, reserve_repair_attempt,
+                save_job, update_repair_operation)
+from providers import generate_with_provider
+from taxonomy import get_weakness
+from app import (MAX_REPAIR_ATTEMPTS, REPAIR_GENERATION_TIMEOUT,
+                 _build_repair_context, _proposal_summary, _rejected_attempt,
+                 _repair_path, _tree_hash, _validate_edits)
 from analysis_pipeline import run_analysis, validate_analysis_mode
 from scanner import analyze
 
@@ -28,6 +44,209 @@ SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", "venv", ".venv",
 SOURCE_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+SYSTEM_HEADERS = {
+    "assert.h", "complex.h", "ctype.h", "errno.h", "fenv.h", "float.h", "inttypes.h",
+    "iso646.h", "limits.h", "locale.h", "math.h", "setjmp.h", "signal.h", "stdalign.h",
+    "stdarg.h", "stdatomic.h", "stdbool.h", "stddef.h", "stdint.h", "stdio.h", "stdlib.h",
+    "stdnoreturn.h", "string.h", "tgmath.h", "threads.h", "time.h", "uchar.h", "wchar.h",
+    "wctype.h", "algorithm", "array", "atomic", "bit", "cassert", "cctype", "cerrno",
+    "cmath", "cstdio", "cstdlib", "cstring", "ctime", "iostream", "map", "memory", "optional",
+    "string", "string_view", "utility", "vector",
+}
+
+
+def _generate_repair_child(result_queue, job_id: str, operation_id: str, provider: str, context: dict) -> None:
+    try:
+        generation_url = os.getenv("REPAIR_GENERATION_URL", "")
+        if generation_url:
+            secret = os.getenv("REPAIR_INTERNAL_SECRET", "")
+            request = urllib.request.Request(generation_url, data=json.dumps({"provider": provider, "context": context}).encode(),
+                headers={"Content-Type": "application/json", "X-Repair-Secret": secret}, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    generated = json.loads(response.read().decode())
+            except urllib.error.HTTPError as exc:
+                try:
+                    message = json.loads(exc.read().decode()).get("detail", str(exc))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    message = str(exc)
+                raise RuntimeError(f"Repair provider request failed: {message}") from exc
+            result_payload = generated["proposal"]
+            provider_used, model_used = generated["provider_used"], generated["model"]
+        else:
+            result, provider_used = generate_with_provider(
+                provider, context,
+                on_event=lambda event: update_repair_operation(job_id, operation_id, event),
+            )
+            result_payload = result.model_dump()
+            model_used = (os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b") if provider == "deep"
+                          else os.getenv("GROQ_MODEL", "openai/gpt-oss-120b") if provider_used == "groq"
+                          else os.getenv("OLLAMA_MODEL", "qwen2.5:3b") if provider_used == "ollama"
+                          else os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+        result_queue.put(("ok", result_payload, provider_used, model_used))
+    except BaseException as exc:
+        result_queue.put(("error", str(exc)[:500], "", ""))
+
+
+def _generate_with_deadline(job_id: str, operation_id: str, provider: str, context: dict, deadline: float):
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError("Repair generation exceeded the 3-minute time limit.")
+    mp = multiprocessing.get_context("fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn")
+    result_queue = mp.Queue()
+    process = mp.Process(target=_generate_repair_child,
+                         args=(result_queue, job_id, operation_id, provider, context), daemon=True)
+    process.start()
+    process.join(remaining)
+    if process.is_alive():
+        process.terminate()
+        process.join(3)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(2)
+        result_queue.close()
+        raise TimeoutError("Repair generation exceeded the 3-minute time limit.")
+    try:
+        status, payload, provider_used, model_used = result_queue.get(timeout=1)
+    except queue.Empty as exc:
+        raise RuntimeError("The model process stopped without returning a suggestion.") from exc
+    finally:
+        result_queue.close()
+    if status != "ok":
+        raise RuntimeError(payload)
+    from providers import PatchProposal
+    return PatchProposal.model_validate(payload), provider_used, model_used
+
+
+def generate_repair(job_id: str, job: dict) -> None:
+    operation = job.get("repair_operation") or {}
+    operation_id = operation.get("id", "")
+    finding_id = operation.get("finding_id", "")
+    finding = next((item for item in job.get("findings", []) if item.get("id") == finding_id), None)
+    source_root = (JOBS_ROOT / job_id / "source").resolve()
+    candidate_root = None
+    if not finding:
+        update_repair_operation(job_id, operation_id, {"status": "failed", "stage": "failed", "error": "Finding no longer exists."})
+        return
+    target = (source_root / finding.get("file", "")).resolve()
+    if not target.is_relative_to(source_root) or not target.is_file():
+        update_repair_operation(job_id, operation_id, {"status": "failed", "stage": "failed", "error": "Finding source is no longer available."})
+        return
+    try:
+        before = target.read_bytes().decode("utf-8")
+        weakness = get_weakness((finding.get("cwe") or {}).get("id", ""))
+        if not weakness:
+            raise ValueError("CWE mapping could not be loaded.")
+        context = _build_repair_context(before, finding, weakness, source_root, target)
+    except Exception as exc:
+        update_repair_operation(job_id, operation_id, {"status": "failed", "stage": "failed", "error": str(exc)[:500]})
+        return
+
+    attempts = list(operation.get("attempts", []))
+    deadline = float(operation.get("deadline", time.time() + REPAIR_GENERATION_TIMEOUT))
+    provider = "deep" if operation.get("mode") == "deep" else job.get("provider", "none")
+    result = None
+    provider_used = provider
+    after = ""
+    edits: list[dict] = []
+    added = deleted = 0
+    while time.time() < deadline:
+        attempt = reserve_repair_attempt(job_id, operation_id)
+        if not attempt:
+            update_repair_operation(job_id, operation_id, {
+                "status": "human_review", "stage": "human review",
+                "error": "The three-suggestion limit has been reached. Review the original code and suggestions manually.",
+                "attempts": attempts,
+            })
+            return
+        update_repair_operation(job_id, operation_id, {
+            "stage": "generating" if attempt == 1 else "retrying",
+            "attempt": attempt,
+        })
+        result = None
+        try:
+            result, provider_used, model_used = _generate_with_deadline(job_id, operation_id, provider, context, deadline)
+            if operation.get("mode") != "deep":
+                provider = provider_used
+            update_repair_operation(job_id, operation_id, {"stage": "checking edits", "provider": provider_used, "model": model_used})
+            if result.file != finding["file"]:
+                raise ValueError("invalid_path: Repair targets a different file.")
+            after, edits, added, deleted = _validate_edits(
+                before, [edit.model_dump() for edit in result.edits], context["scope_start"], context["scope_end"]
+            )
+            break
+        except TimeoutError as exc:
+            attempts.append({"attempt": attempt, "at": time.time(), "code": "timeout",
+                             "stage": "generating", "message": "Repair generation timed out. Your original code is unchanged.",
+                             "technical": str(exc), "retryable": attempt < MAX_REPAIR_ATTEMPTS, "edits": []})
+            update_repair_operation(job_id, operation_id, {
+                "status": "timed_out", "stage": "timed out", "attempts": attempts,
+                "error": "Repair generation exceeded the 3-minute time limit. Your original code is unchanged.",
+            })
+            return
+        except (ValueError, RuntimeError) as exc:
+            detail = _rejected_attempt(exc, result, before, attempt)
+            attempts.append(detail)
+            exhausted = attempt >= MAX_REPAIR_ATTEMPTS
+            update_repair_operation(job_id, operation_id, {
+                "status": "human_review" if exhausted else "failed",
+                "stage": "human review" if exhausted else "repair attempt failed",
+                "attempts": attempts, "error_detail": detail, "error": detail["message"],
+            })
+            return
+    else:
+        update_repair_operation(job_id, operation_id, {
+            "status": "timed_out", "stage": "timed out", "attempts": attempts,
+            "error": "Repair generation exceeded the 3-minute time limit. Your original code is unchanged.",
+        })
+        return
+
+    if time.time() >= deadline:
+        update_repair_operation(job_id, operation_id, {
+            "status": "timed_out", "stage": "timed out", "attempts": attempts,
+            "error": "Repair generation exceeded the 3-minute time limit. Your original code is unchanged.",
+        })
+        return
+    diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile=f"a/{finding['file']}", tofile=f"b/{finding['file']}"))
+    repair_id = str(uuid.uuid4())
+    metadata = {"line": finding["line"], "scope_start_line": context["scope_start_line"],
+                "scope_end_line": context["scope_end_line"], "localization": "bounded line window",
+                "added_lines": added, "deleted_lines": deleted,
+                "reasons": [edit["reason"] for edit in edits],
+                "security_improvement": result.security_improvement,
+                "warnings": ["Function boundaries were not established; scope is based on nearby lines."]}
+    repair = {"id": repair_id, "finding_id": finding_id, "mode": operation.get("mode", "standard"), "file": finding["file"], "code": after,
+              "diff": diff, "explanation": result.explanation, "provider_used": provider_used, "model_used": model_used,
+              "state": "validating", "created_at": time.time(), "source_hash": hashlib.sha256(before.encode()).hexdigest(),
+              "scope_start": context["scope_start"], "scope_end": context["scope_end"], "edits": edits,
+              "metadata": metadata, "operation_id": operation_id,
+              "checks": {"build": "pending", "tests": "pending", "sanitizers": "pending",
+                         "security": "pending", "verification": "pending", "performance": "not_measured"}}
+    repair_file = None
+    try:
+        candidate_root = JOBS_ROOT / job_id / "candidates" / repair_id
+        candidate_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_root, candidate_root)
+        candidate_target = (candidate_root / finding["file"]).resolve()
+        if not candidate_target.is_relative_to(candidate_root.resolve()):
+            raise ValueError("Invalid candidate path.")
+        candidate_target.write_bytes(after.encode("utf-8"))
+        repair["candidate_hash"] = _tree_hash(candidate_root)
+        repair_dir = JOBS_ROOT / job_id / "repairs"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        repair_file = _repair_path(job_id, repair_id)
+        repair_file.write_text(json.dumps(repair), encoding="utf-8")
+        if not enqueue_repair(job_id, operation_id, repair, _proposal_summary(repair)):
+            raise RuntimeError("Repair operation expired or was replaced.")
+    except Exception as exc:
+        if candidate_root:
+            shutil.rmtree(candidate_root, ignore_errors=True)
+        if repair_file:
+            repair_file.unlink(missing_ok=True)
+        update_repair_operation(job_id, operation_id, {
+            "status": "failed", "stage": "failed", "attempts": attempts,
+            "error": f"Could not prepare the repair candidate: {str(exc)[:300]}"})
 
 
 def update(job_id: str, **changes) -> dict:
@@ -105,7 +324,135 @@ def sandbox_command(command: list[str], project: Path, build: Path, extra_env: d
     return args
 
 
-def validate_build(job_dir: Path, source: Path, on_check=None) -> dict:
+def _compile_database_flags(source: Path, file: Path) -> list[str]:
+    database = source / "compile_commands.json"
+    if not database.is_file() or database.stat().st_size > 5_000_000:
+        return []
+    try:
+        entries = json.loads(database.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    for entry in entries if isinstance(entries, list) else []:
+        try:
+            directory = Path(entry["directory"]).resolve()
+            candidate = Path(entry["file"])
+            candidate = (directory / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+            candidate.relative_to(source.resolve())
+            if candidate != file.resolve():
+                continue
+            args = entry.get("arguments") or shlex.split(entry.get("command", ""))
+            if not args or Path(args[0]).name not in {"clang", "clang++", "cc", "c++", "gcc", "g++"}:
+                return []
+            flags: list[str] = []
+            index = 1
+            while index < len(args):
+                arg = args[index]
+                if arg in {"-I", "-isystem"} and index + 1 < len(args):
+                    include = Path(args[index + 1])
+                    include = (directory / include).resolve() if not include.is_absolute() else include.resolve()
+                    try:
+                        relative = include.relative_to(source.resolve())
+                        flags += [arg, "/project" if str(relative) == "." else f"/project/{relative.as_posix()}"]
+                    except ValueError:
+                        if include.is_relative_to(Path("/usr")):
+                            flags += [arg, str(include)]
+                    index += 2
+                    continue
+                if arg.startswith(("-D", "-U", "-std=", "-W", "-f", "-m")) or arg in {"-pthread", "-ansi"}:
+                    flags.append(arg)
+                index += 1
+            return flags
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return []
+
+
+def _diagnostic_category(message: str, missing_header: str | None = None) -> str:
+    if missing_header:
+        return "missing_system_header" if Path(missing_header).name in SYSTEM_HEADERS else "missing_project_dependency"
+    lower = message.lower()
+    if any(token in lower for token in ("expected ", "unexpected ", "unterminated", "extraneous", "invalid preprocessing directive", "before '")):
+        return "syntax_error"
+    if any(token in lower for token in ("undeclared", "unknown type name", "not declared", "no member named", "incompatible", "cannot initialize", "no matching")):
+        return "type_error"
+    return "compiler_error"
+
+
+def _parse_compiler_diagnostics(output: str, source: Path, source_name: str) -> list[dict]:
+    diagnostics = []
+    pattern = re.compile(r"^(.*?):(\d+):(\d+): (?:fatal )?error: (.*)$")
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        location, row, column, message = match.groups()
+        header = re.search(r"['\"]([^'\"]+)['\"] file not found", message)
+        try:
+            normalized = Path(location.removeprefix("/project/")).as_posix()
+            if location.startswith("/project/"):
+                normalized = Path(location[len("/project/"):]).as_posix()
+        except (OSError, ValueError):
+            normalized = location
+        diagnostics.append({"category": _diagnostic_category(message, header.group(1) if header else None),
+                            "file": normalized, "line": int(row), "column": int(column),
+                            "message": message, "source": source_name})
+    return diagnostics
+
+
+def _syntax_check(source: Path, build: Path, source_name: str = "original") -> dict:
+    files = sorted(path for path in source.rglob("*") if path.is_file() and path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"})
+    if not files:
+        return {"build": "not_available", "diagnostics": [], "details": "No C/C++ translation units were found for a syntax check."}
+    if not shutil.which("clang"):
+        return {"build": "not_available", "diagnostics": [{"category": "toolchain_unavailable", "file": "", "line": 0, "column": 0, "message": "Clang is not installed.", "source": source_name}], "details": "Syntax check unavailable: Clang is not installed."}
+    if not sandbox_command(["/bin/true"], source, build):
+        return {"build": "not_available", "diagnostics": [{"category": "toolchain_unavailable", "file": "", "line": 0, "column": 0, "message": "bubblewrap is not installed.", "source": source_name}], "details": "Syntax check unavailable: bubblewrap is not installed."}
+    diagnostics = []
+    outputs = []
+    deadline = time.monotonic() + 45
+    limited = len(files) > 80
+    for file in files[:80]:
+        if time.monotonic() >= deadline:
+            limited = True
+            break
+        relative = file.resolve().relative_to(source.resolve()).as_posix()
+        compiler = "clang++" if file.suffix.lower() in {".cc", ".cpp", ".cxx"} else "clang"
+        # Keep the source path as the final argument and apply only safe, project-local compile flags.
+        command = [compiler, "-fsyntax-only", "-fno-color-diagnostics", "-I", "/project"]
+        parent = file.parent.relative_to(source).as_posix()
+        if parent != ".":
+            command += ["-I", f"/project/{parent}"]
+        command += _compile_database_flags(source, file)
+        command.append(f"/project/{relative}")
+        wrapped = sandbox_command(command, source, build)
+        try:
+            result = subprocess.run(wrapped or [], capture_output=True, text=True, timeout=min(5, max(1, deadline-time.monotonic())), check=False, preexec_fn=_limits)
+            output = result.stderr + "\n" + result.stdout
+            outputs.append(output.strip())
+            file_diagnostics = _parse_compiler_diagnostics(output, source, source_name)
+            diagnostics.extend(file_diagnostics)
+            if result.returncode and not file_diagnostics:
+                diagnostics.append({"category": "compiler_error", "file": relative, "line": 0, "column": 0,
+                                    "message": f"Compiler exited with status {result.returncode} without a recognized diagnostic.", "source": source_name})
+        except subprocess.TimeoutExpired:
+            diagnostics.append({"category": "toolchain_unavailable", "file": relative, "line": 0, "column": 0,
+                                "message": "Syntax check exceeded its per-file time limit.", "source": source_name})
+        except OSError as exc:
+            diagnostics.append({"category": "toolchain_unavailable", "file": relative, "line": 0, "column": 0,
+                                "message": str(exc)[:500], "source": source_name})
+    errors = [item for item in diagnostics if item["category"] not in {"missing_project_dependency", "missing_system_header", "toolchain_unavailable"}]
+    missing = [item for item in diagnostics if item["category"] in {"missing_project_dependency", "missing_system_header"}]
+    toolchain = [item for item in diagnostics if item["category"] == "toolchain_unavailable"]
+    status = "failed" if errors else "not_available" if missing or toolchain or limited else "passed"
+    details = "\n".join(output for output in outputs if output)[-6000:]
+    if limited:
+        details += "\nSyntax check limited to 80 files or 45 seconds."
+    if not details and status == "passed":
+        details = "Clang syntax checks passed."
+    return {"build": status, "diagnostics": diagnostics, "details": details}
+
+
+def validate_build(job_dir: Path, source: Path, on_check=None, baseline_source: Path | None = None) -> dict:
     def report(name, status):
         if on_check:
             on_check(name, status)
@@ -113,7 +460,7 @@ def validate_build(job_dir: Path, source: Path, on_check=None) -> dict:
     if build.exists():
         shutil.rmtree(build)
     build.mkdir()
-    result = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "performance": "not_measured", "details": "No recognized build system found."}
+    result = {"build": "not_available", "tests": "not_available", "sanitizers": "not_available", "performance": "not_measured", "details": "No recognized build system found.", "build_diagnostics": []}
     command = None
     tests = None
     if (source / "CMakeLists.txt").is_file():
@@ -125,6 +472,31 @@ def validate_build(job_dir: Path, source: Path, on_check=None) -> dict:
         if "test:" in makefile.read_text(encoding="utf-8", errors="replace"):
             tests = ["make", "test"]
     if not command:
+        if on_check:
+            on_check("build", "running")
+        candidate = _syntax_check(source, build, "proposed" if baseline_source else "original")
+        diagnostics = list(candidate["diagnostics"])
+        status = candidate["build"]
+        details = candidate["details"]
+        if baseline_source:
+            baseline = _syntax_check(baseline_source, build, "original")
+            diagnostics = baseline["diagnostics"] + diagnostics
+            candidate_missing = [item for item in candidate["diagnostics"] if item["category"] in {"missing_project_dependency", "missing_system_header"}]
+            baseline_missing = {(item["category"], item["file"], item["message"]) for item in baseline["diagnostics"] if item["category"] in {"missing_project_dependency", "missing_system_header"}}
+            introduced_missing = any((item["category"], item["file"], item["message"]) not in baseline_missing for item in candidate_missing)
+            shared_missing = bool(candidate_missing) and not introduced_missing
+            candidate_errors = [item for item in candidate["diagnostics"] if item["category"] in {"syntax_error", "type_error", "compiler_error"}]
+            if candidate_errors or introduced_missing:
+                status = "failed"
+            elif candidate_missing or candidate["build"] == "not_available" or baseline["build"] == "not_available":
+                status = "not_available"
+            else:
+                status = candidate["build"]
+            details = "Original source:\n" + baseline["details"] + "\nProposed source:\n" + candidate["details"]
+            result["baseline_shared_dependency"] = shared_missing and not candidate_errors
+        result.update(build=status, build_diagnostics=diagnostics, details=details)
+        if on_check:
+            on_check("build", status)
         return result
     result["details"] = "Build scripts run only inside bubblewrap with separate network, process, and filesystem namespaces."
     wrapped = sandbox_command(command, source, build)
@@ -142,12 +514,14 @@ def validate_build(job_dir: Path, source: Path, on_check=None) -> dict:
         build_result = subprocess.run(wrapped, capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
         result["build"] = "passed" if build_result.returncode == 0 else "failed"
         result["details"] = (build_result.stderr or build_result.stdout)[-3000:]
+        result["build_diagnostics"] = _parse_compiler_diagnostics(build_result.stderr + "\n" + build_result.stdout, source, "proposed")
         if build_result.returncode != 0:
             return result
         if command[0] == "cmake":
             wrapped_compile = sandbox_command(["cmake", "--build", "/build", "--parallel", "1"], source, build)
             compile_result = subprocess.run(wrapped_compile or [], capture_output=True, text=True, timeout=JOB_TIMEOUT, check=False, preexec_fn=_limits)
             result["details"] += "\nBuild:\n" + (compile_result.stderr or compile_result.stdout)[-3000:]
+            result["build_diagnostics"] += _parse_compiler_diagnostics(compile_result.stderr + "\n" + compile_result.stdout, source, "proposed")
             if compile_result.returncode != 0:
                 result["build"] = "failed"
                 return result
@@ -370,7 +744,25 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
         shutil.copytree(candidate, validation_source)
         if not update_repair_operation(job_id, operation_id, {"status": "verifying", "stage": "preparing verification", "lease_until": time.time() + 120}):
             return
-        checks = validate_build(workspace, validation_source, on_check=report)
+        baseline_source = workspace / "baseline-source"
+        original_source = job_dir / "source"
+        if original_source.is_dir():
+            shutil.copytree(original_source, baseline_source)
+            checks = validate_build(workspace, validation_source, on_check=report, baseline_source=baseline_source)
+            shutil.rmtree(baseline_source, ignore_errors=True)
+        else:
+            checks = validate_build(workspace, validation_source, on_check=report)
+        baseline_diagnostics = (job.get("checks") or {}).get("build_diagnostics", [])
+        candidate_diagnostics = [item for item in checks.get("build_diagnostics", []) if item.get("source") == "proposed"]
+        dependency_categories = {"missing_project_dependency", "missing_system_header"}
+        baseline_dependencies = {(item.get("category"), item.get("file"), item.get("message")) for item in baseline_diagnostics if item.get("category") in dependency_categories}
+        candidate_dependencies = [item for item in candidate_diagnostics if item.get("category") in dependency_categories]
+        candidate_compile_errors = [item for item in candidate_diagnostics if item.get("category") in {"syntax_error", "type_error", "compiler_error"}]
+        shared_missing_dependency = bool(candidate_dependencies) and not candidate_compile_errors and all((item.get("category"), item.get("file"), item.get("message")) in baseline_dependencies for item in candidate_dependencies)
+        checks["baseline_shared_dependency"] = bool(checks.get("baseline_shared_dependency") or shared_missing_dependency)
+        if checks.get("build") == "failed" and shared_missing_dependency:
+            checks["build"] = "not_available"
+            checks["details"] = (checks.get("details", "") + "\nThe same missing dependency prevents compiling the original and proposed source.").strip()
         for key in ("build", "tests", "sanitizers"):
             report(key, checks[key])
         shutil.rmtree(validation_source, ignore_errors=True)
@@ -400,7 +792,7 @@ def validate_repair(job_id: str, job: dict | None = None) -> None:
         checks["verification_outcome"] = (
             "failed" if "failed" in available else
             "verified" if all(value == "passed" for value in available) else
-            "partially_verified" if "passed" in available else "not_verified"
+            "partially_verified" if "passed" in available or (checks.get("baseline_shared_dependency") and checks.get("build") == "not_available") else "not_verified"
         )
         finish_repair(job_id, operation_id, candidate_id, checks, performance)
     except Exception as exc:
@@ -419,7 +811,9 @@ def main() -> None:
     retry_delay = 5
     while True:
         try:
-            item = claim_job()
+            recover_repairs()
+            repair_item = claim_repair_generation()
+            item = None if repair_item else claim_job()
         except Exception as exc:
             message = str(exc).splitlines()[0]
             logging.error(
@@ -432,10 +826,25 @@ def main() -> None:
             retry_delay = min(60, retry_delay * 2)
             continue
         retry_delay = 5
-        if item:
+        if repair_item:
+            job_id, job = repair_item
+            try:
+                generate_repair(job_id, job)
+            except Exception as exc:
+                logging.exception("Repair generation for job %s failed unexpectedly", job_id)
+                try:
+                    operation = (get_job(job_id) or {}).get("repair_operation") or {}
+                    if operation.get("status") in ("queued", "running"):
+                        update_repair_operation(job_id, operation.get("id", ""), {
+                            "status": "failed", "stage": "failed",
+                            "error": f"Repair generation stopped unexpectedly: {str(exc)[:300]}",
+                        })
+                except Exception:
+                    logging.exception("Could not save repair failure for job %s", job_id)
+        elif item:
             job_id, job = item
             try:
-                if job.get("state") == "verifying":
+                if job.get("state") in ("validating", "verifying"):
                     validate_repair(job_id, job)
                 else:
                     process(job_id)

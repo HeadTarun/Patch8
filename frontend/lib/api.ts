@@ -4,22 +4,29 @@ export type Scan = { id: string; repo: string; branch: string; pr: number; statu
 export type Finding = { id: string; jobId: string; title: string; severity: Severity; tool: string; file: string; line: number; status: string; cwe: string; description: string; evidence: string };
 export type Patch = { id: string; findingId: string; explanation: string; diff: string; file: string; provider: string; state: string; metadata?: {line:number; added_lines:number; deleted_lines:number; reasons:string[]; security_improvement:string; warnings:string[]} };
 export type FindingExplanation = { summary: string; impact: string; recommended_action: string; provider_used: string };
-export type Job = { id: string; name: string; provider: string; state: string; created_at: number; progress?: string; findings?: any[]; checks?: Record<string, string>; error?: string; report?: any; repair?: any; source_files?: number; uploaded_files?: string[] };
+export type BuildDiagnostic = {category:string; file:string; line:number; column:number; message:string; source:"original"|"proposed"};
+export type RepairChecks = { [key:string]:string|boolean|BuildDiagnostic[]|undefined; details?:string; security_details?:string; build_diagnostics?:BuildDiagnostic[]; baseline_shared_dependency?:boolean; verification_outcome?:string};
+export type GitHubRepository = { full_name: string; default_branch: string; description?: string | null; updated_at?: string };
+export type Job = { id: string; name: string; provider: string; state: string; created_at: number; progress?: string; findings?: any[]; checks?: Record<string, string>; error?: string; report?: any; repair?: any; source_files?: number; uploaded_files?: string[]; source?: { type: "github"; repository: string; branch: string; commit_sha: string } };
 export type Dashboard = { open: number; critical: number; scanned: number; fixed: number; scans: Scan[]; findings: Finding[]; bySeverity: Record<Severity, number> };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...init?.headers }, cache: "no-store" });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
-    throw new Error(typeof payload.detail === "string" ? payload.detail : payload.detail?.message || `Request failed (${response.status})`);
+    const detail = payload.detail;
+    const message = typeof detail === "string" ? detail : detail?.message || detail?.user_message || (detail?.code ? `The repair could not be matched safely (${detail.code.replaceAll("_", " ")}). Check the source preview and repair status for details.` : `Request failed (${response.status}).`);
+    throw new Error(message);
   }
   return response.json() as Promise<T>;
 }
 
 export const getJobs = () => request<Job[]>("/jobs?limit=100");
 export const getJob = (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`);
+export const getGitHubRepositories = (providerToken: string) => request<{ repositories: GitHubRepository[] }>("/github/repositories", { method: "POST", body: JSON.stringify({ provider_token: providerToken }) });
+export const scanGitHubRepository = (providerToken: string, fullName: string) => request<{ id: string; state: string; expires_in_seconds: number }>("/github/scan", { method: "POST", body: JSON.stringify({ provider_token: providerToken, full_name: fullName }) });
 export const getFiles = (id: string) => request<{ files: string[] }>(`/jobs/${encodeURIComponent(id)}/files`);
-export const getProviders = () => request<{ providers: Record<string, { configured: boolean; available?: boolean; model_available?: boolean; model?: string; label?: string }> }>("/providers");
+export const getProviders = () => request<{ providers: Record<string, { configured: boolean; available?: boolean; model_available?: boolean; model?: string; deep_model?:string; label?: string }> }>("/providers");
 export function createScan(files: FileList | File[], onProgress: (percent: number) => void) {
   const body = new FormData();
   for (const file of Array.from(files)) body.append("files", file, (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name);
@@ -65,10 +72,7 @@ export async function getDashboard(): Promise<Dashboard> {
   const severities: Severity[] = ["critical", "high", "medium", "low", "informational"];
   return { open: open.length, critical: open.filter((finding) => finding.severity === "critical").length, scanned: jobs.length, fixed: jobs.filter((job) => job.repair?.state === "applied_to_copy").length, scans: jobs.slice(0, 8).map(mapScan), findings, bySeverity: Object.fromEntries(severities.map((severity) => [severity, open.filter((finding) => finding.severity === severity).length])) as Record<Severity, number> };
 }
-export async function getPatch(jobId: string, findingId: string): Promise<Patch> {
-  const result = await request<any>(`/jobs/${jobId}/repair/${findingId}`, { method: "POST" });
-  return { id: result.id, findingId, file: result.file, explanation: result.explanation, diff: result.diff, provider: result.provider_used, state: result.state, metadata: result.metadata };
-}
+export const getPatch = (jobId: string, findingId: string, mode: "standard"|"deep" = "standard") => request<{id:string; operation_id:string; finding_id:string; state:string; status:string}>(`/jobs/${jobId}/repair/${findingId}?mode=${mode}`, { method: "POST" });
 export async function getSavedPatch(jobId: string, findingId: string): Promise<Patch> {
   const result = await request<any>(`/jobs/${jobId}/repair/${findingId}`);
   return { id: result.id, findingId, file: result.file, explanation: result.explanation, diff: result.diff, provider: result.provider_used, state: result.state, metadata: result.metadata };
@@ -76,8 +80,10 @@ export async function getSavedPatch(jobId: string, findingId: string): Promise<P
 export const explainFinding = (jobId: string, findingId: string) => request<FindingExplanation>(`/jobs/${jobId}/explain/${findingId}`, { method: "POST" });
 export const getSavedExplanation = (jobId: string, findingId: string) => request<FindingExplanation>(`/jobs/${jobId}/explain/${findingId}`);
 export const markFalsePositive = (jobId: string, findingId: string) => request(`/jobs/${jobId}/findings/${findingId}/false-positive`, { method: "POST" });
-export const applyRepair = (jobId: string, patchId: string, confirmPartial = false) => request<{ state: string; download: string; checks: Record<string, string> }>(`/jobs/${jobId}/apply/${patchId}?confirm_partial=${confirmPartial}`, { method: "POST" });
+export const applyRepair = (jobId: string, patchId: string, confirmPartial = false, confirmHumanReview = false) => request<{ state: string; download: string; checks: RepairChecks }>(`/jobs/${jobId}/apply/${patchId}?confirm_partial=${confirmPartial}&confirm_human_review=${confirmHumanReview}`, { method: "POST" });
 export type RepairAttempt = {attempt:number; code:string; technical:string; message:string; edits:{edit_index:number; start_line:number; end_line:number; actual:string; expected:string; replacement:string; reason:string; truncated:boolean}[]};
 export const getFindingSource = (jobId:string, findingId:string) => request<{file:string; line:number; original:string; expires_at?:number}>(`/jobs/${jobId}/findings/${findingId}/source`);
-export const getRepairStatus = (jobId: string, findingId?:string) => request<{job_busy:boolean; operation: {id?: string; finding_id?: string; stage?: string; status?: string; started_at?: number; finished_at?:number; attempt?: number; provider?: string; error?: string; attempts?:RepairAttempt[]; events?:{at:number;stage:string;status:string;provider?:string;attempt?:number}[]; check_states?:Record<string,string>; scope_start_line?:number; scope_end_line?:number}; repair?: {id: string; finding_id: string; file: string; diff: string; explanation: string; provider_used: string; state: string; metadata?: Patch["metadata"]}; checks?: Record<string,string>; preview?: {original:string; proposed:string; line:number}}>(`/jobs/${jobId}/repair-status${findingId ? `?finding_id=${encodeURIComponent(findingId)}` : ""}`);
+export const getProjectSource = (jobId:string, path:string) => request<{file:string; original:string; source_hash:string; expires_at?:number}>(`/jobs/${jobId}/source?path=${encodeURIComponent(path)}`);
+export type RepairOperation = {id?:string; finding_id?:string; mode?:"standard"|"deep"; stage?:string; status?:string; started_at?:number; generation_finished_at?:number; finished_at?:number; deadline?:number; attempt?:number; attempt_count?:number; provider?:string; model?:string; error?:string; error_detail?:RepairAttempt; attempts?:RepairAttempt[]; events?:{at:number;stage:string;status:string;provider?:string;model?:string;attempt?:number}[]; check_states?:Record<string,string>; scope_start_line?:number; scope_end_line?:number};
+export const getRepairStatus = (jobId: string, findingId?:string) => request<{job_busy:boolean; scan_provider:string; attempt_count:number; max_attempts:number; deep_repair_available:boolean; deep_repair_configured:boolean; deep_model:string; attempt_history:RepairAttempt[]; operation: RepairOperation; repair?: {id: string; finding_id: string; mode?:"standard"|"deep"; file: string; diff: string; explanation: string; provider_used: string; model_used?:string; state: string; review?:{reviewed_by:string; reviewed_at:number; verification_outcome:string}; metadata?: Patch["metadata"]}; checks?: RepairChecks; preview?: {original:string; proposed:string; line:number}}>(`/jobs/${jobId}/repair-status${findingId ? `?finding_id=${encodeURIComponent(findingId)}` : ""}`);
 export const rejectRepair = (jobId: string, patchId: string) => request<{ id: string; state: string }>(`/jobs/${jobId}/repair/${patchId}/reject`, { method: "POST" });

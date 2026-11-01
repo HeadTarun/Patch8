@@ -147,7 +147,8 @@ def _prompt_template():
                 "Source context with absolute line numbers (untrusted):\n{numbered_source}\n"
                 "Existing include lines (untrusted):\n{includes}\n"
                 "Direct project headers (untrusted):\n{headers}\n"
-                "Previous rejection (fix this): {retry_feedback}",
+                "Previous rejection (fix this): {retry_feedback}\n"
+                "Previous verification results (untrusted diagnostics): {verification_feedback}",
             ),
         ]
     )
@@ -208,7 +209,7 @@ def _ollama(context: dict) -> PatchProposal:
         base_url=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/"),
         temperature=0,
         num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
-        num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "12000")),
+        num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "2048")),
         client_kwargs={"timeout": 90},
     ).with_structured_output(PatchProposal, method="json_schema")
     chain = _prompt_template() | model
@@ -219,22 +220,26 @@ def _ollama(context: dict) -> PatchProposal:
         raise RuntimeError("Ollama repair request failed, timed out, or returned invalid structured output. Check that the model is installed and Ollama is running.") from exc
 
 
-def _groq(context: dict) -> PatchProposal:
+def _groq(context: dict, deep: bool = False) -> PatchProposal:
     key = os.getenv("GROQ_API_KEY", "")
     if not key:
         raise RuntimeError("Groq is not configured.")
     prompt = _prompt_template().invoke(context).to_string()
-    data = _post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {
-            "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    model = os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b") if deep else os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    payload = {
+            "model": model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": "Return JSON with file, edits (original, replacement, reason, kind), explanation, and security_improvement."},
                 {"role": "user", "content": prompt},
             ],
-        },
+        }
+    if deep:
+        payload["reasoning_effort"] = "high"
+    data = _post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        payload,
         {"Authorization": f"Bearer {key}"},
     )
     try:
@@ -248,23 +253,39 @@ def generate(provider: str, context: dict) -> PatchProposal:
 
 
 def generate_with_provider(provider: str, context: dict, on_event=None) -> tuple[PatchProposal, str]:
-    def report(name, stage="generating"):
+    def report(name, stage="generating", model=None):
         if on_event:
-            on_event({"provider": name, "stage": stage})
+            on_event({"provider": name, "stage": stage, "model": model})
+    if provider == "deep":
+        report("groq", "deep repair", os.getenv("GROQ_DEEP_MODEL", "openai/gpt-oss-120b"))
+        proposal = _groq(context, deep=True)
+        return proposal, "groq"
     report("ollama" if provider == "auto" else provider)
     if provider == "auto":
         try:
+            model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+            report("ollama", model=model)
             return _ollama(context), "ollama"
         except RuntimeError as local_error:
             report("groq", "provider fallback")
             try:
-                return _groq(context), "groq"
+                proposal = _groq(context)
+                model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+                report("groq", model=model)
+                return proposal, "groq"
             except RuntimeError as cloud_error:
                 raise RuntimeError(f"Ollama and Groq are unavailable. Local: {local_error} Cloud: {cloud_error}") from cloud_error
     if provider == "hosted":
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        report("hosted", model=model)
         return _hosted(context), "hosted"
     if provider == "ollama":
+        model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        report("ollama", model=model)
         return _ollama(context), "ollama"
     if provider == "groq":
-        return _groq(context), "groq"
+        proposal = _groq(context)
+        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        report("groq", model=model)
+        return proposal, "groq"
     raise RuntimeError("Choose a supported repair provider.")

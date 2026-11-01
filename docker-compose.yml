@@ -21,11 +21,14 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      GROQ_DEEP_MODEL: ${GROQ_DEEP_MODEL:-openai/gpt-oss-120b}
+      REPAIR_INTERNAL_SECRET: ${REPAIR_INTERNAL_SECRET:?Set REPAIR_INTERNAL_SECRET in .env; see .env.example}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-32768}
-      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-12000}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-2048}
       MAX_REPAIR_CONTEXT_CHARS: ${MAX_REPAIR_CONTEXT_CHARS:-24000}
+      MAX_DEEP_REPAIR_CONTEXT_CHARS: ${MAX_DEEP_REPAIR_CONTEXT_CHARS:-48000}
       MAX_REPAIR_CHANGED_LINES: ${MAX_REPAIR_CHANGED_LINES:-200}
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes: ["jobs:/work"]
@@ -51,10 +54,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile.next
-      args:
-        NEXT_PUBLIC_SPLINE_SCENE_URL: ${NEXT_PUBLIC_SPLINE_SCENE_URL:-}
     environment:
-      NEXT_PUBLIC_SPLINE_SCENE_URL: ${NEXT_PUBLIC_SPLINE_SCENE_URL:-}
       PORT: "3000"
       HOSTNAME: "0.0.0.0"
     networks: [inside]
@@ -75,10 +75,12 @@ services:
       JOB_TTL_SECONDS: "3600"
       JOB_TIMEOUT_SECONDS: "90"
       ANALYSIS_MODE: ${ANALYSIS_MODE:-legacy}
+      REPAIR_GENERATION_URL: http://api:8000/api/internal/repair/generate
+      REPAIR_INTERNAL_SECRET: ${REPAIR_INTERNAL_SECRET:?Set REPAIR_INTERNAL_SECRET in .env; see .env.example}
       MAX_PROJECT_FILES: "5000"
       MAX_EXTRACTED_BYTES: "100000000"
     volumes: ["jobs:/work"]
-    networks: [egress]
+    networks: [inside, egress]
     read_only: true
     tmpfs: ["/tmp:size=256m,noexec,nosuid"]
     security_opt: [no-new-privileges:true]
