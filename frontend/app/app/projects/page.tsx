@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { Archive, FileCode2, FolderOpen, LoaderCircle, Upload } from "lucide-react";
+import { Archive, FileCode2, FolderOpen, Github, LoaderCircle, Upload } from "lucide-react";
 import { AppShell } from "@/components/app-shell";
 import { CodePreview } from "@/components/code-preview";
 import { EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
@@ -44,7 +44,10 @@ export default function Projects() {
   }
   return <AppShell active="Projects"><main className="app-content">
     <div className="page-head"><div><div className="eyebrow">SOURCE PROJECTS</div><h1>Upload a project</h1><p>Scan C and C++ files with the installed Clang, Cppcheck, and Semgrep analyzers. Files are retained for up to one hour.</p></div></div>
-    <p className="muted">You can also <a className="accent" href="/api/auth/github">connect GitHub to scan a public repository</a>. Automatic AI uses Ollama first; if unavailable, relevant source is sent to Groq when configured.</p>
+    <div className="github-connect-banner">
+      <div><strong>Scan a GitHub repository</strong><span>Connect your GitHub account to scan any public repository on its default branch.</span></div>
+      <a className="button github-button" href="/api/auth/github"><Github size={16} />Connect GitHub</a>
+    </div>
     <section className="panel setting-card"><div className="panel-head"><div><h2>New scan</h2><p className="muted">Choose files, a project folder, or one ZIP archive.</p></div><Upload size={18} className="accent"/></div>
       <div className="filter-row"><label className="button"><input className="sr-only" aria-label="Choose source files" type="file" accept=".c,.cc,.cpp,.cxx,.h,.hh,.hpp,.hxx,.zip" multiple onChange={e=>choose(e.target.files)}/><Archive size={15}/> Choose files or ZIP</label><input ref={folderRef} className="sr-only" type="file" multiple aria-label="Choose project folder" onChange={e=>choose(e.target.files,true)}/><button className="button" type="button" onClick={()=>{folderRef.current?.setAttribute("webkitdirectory","");folderRef.current?.click()}}><FolderOpen size={15}/> Choose folder</button></div>
       {selected.length>0&&<div className="section-gap"><div className="eyebrow">{selected.length} FILE{selected.length===1?"":"S"} SELECTED</div><div className="code-block" style={{maxHeight:140}}>{selected.slice(0,12).map(file=><span className="code-line" key={`${file.webkitRelativePath}-${file.name}`}>{file.webkitRelativePath||file.name}</span>)}{selected.length>12&&<span className="code-line">and {selected.length-12} more…</span>}</div>
